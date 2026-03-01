@@ -23,6 +23,11 @@ public class PartitionInfo
     public long SizeBytes { get; set; }
 
     /// <summary>
+    /// The size it will have on the target disk (may be smaller than SizeBytes for auto-shrink).
+    /// </summary>
+    public long TargetSizeBytes { get; set; }
+
+    /// <summary>
     /// For GPT: The partition type GUID.
     /// </summary>
     public Guid? PartitionTypeGuid { get; set; }
@@ -164,6 +169,8 @@ public class PartitionInfo
         if (PartitionTypeGuid.HasValue)
         {
             var guid = PartitionTypeGuid.Value;
+            if (guid == Guid.Parse("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"))
+                return "EFI System Partition";
             if (guid == Guid.Parse("E3C9E316-0B5C-4DB8-817D-F92DF00215AE"))
                 return "Microsoft Reserved";
             if (guid == Guid.Parse("DE94BBA4-06D1-4D40-A16A-BFD50179D6AC"))

@@ -46,6 +46,7 @@ internal static class WindowsApi
     public const uint FSCTL_UNLOCK_VOLUME = 0x0009001C;
     public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009003F;
     public const uint FSCTL_EXTEND_VOLUME = 0x000900F0;
+    public const uint IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000;
 
     public const uint ERROR_SUCCESS = 0;
     public const uint ERROR_LOCK_VIOLATION = 33;
@@ -202,6 +203,22 @@ internal static class WindowsApi
         public long StartingLcn;
         public long BitmapSize;
         public byte Buffer; // Variable length bitmap
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct DISK_EXTENT
+    {
+        public uint DiskNumber;
+        public long StartingOffset;
+        public long ExtentLength;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VOLUME_DISK_EXTENTS
+    {
+        public uint NumberOfDiskExtents;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 1)]
+        public DISK_EXTENT[] Extents;
     }
 
     #endregion

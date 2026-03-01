@@ -96,8 +96,8 @@ public class DiskClonerEngine
                 progress.StatusMessage = $"Copying {partition.GetTypeName()} ({partition.SizeDisplay})...";
                 ReportProgress(progress);
 
-                var copied = await CopyPartitionAsync(operation, partition, progress);
-                bytesCopied += copied;
+                bytesCopied = await CopyPartitionAsync(operation, partition, progress, bytesCopied);
+                
                 progress.BytesCopied = bytesCopied;
                 progress.PercentComplete = (bytesCopied * 100.0) / totalBytesToCopy;
                 ReportProgress(progress);
@@ -120,10 +120,10 @@ public class DiskClonerEngine
             }
 
             // Step 6: Expand partitions
-            if (operation.AutoExpandWindowsPartition && operation.TargetDisk.SizeBytes > operation.SourceDisk.SizeBytes)
+            if (operation.AutoExpandWindowsPartition || operation.AllowSmallerTarget)
             {
                 progress.Stage = CloneStage.ExpandingPartitions;
-                progress.StatusMessage = "Expanding Windows partition...";
+                progress.StatusMessage = operation.AllowSmallerTarget ? "Fixing NTFS metadata..." : "Expanding Windows partition...";
                 ReportProgress(progress);
 
                 await ExpandPartitionAsync(operation, progress);
@@ -226,20 +226,64 @@ public class DiskClonerEngine
         if (operation.TargetDisk.IsReadOnly)
             throw new InvalidOperationException("Target disk is read-only");
 
-        // Check target size
-        if (operation.TargetDisk.SizeBytes < operation.SourceDisk.SizeBytes)
-        {
-            if (!operation.AllowSmallerTarget)
-            {
-                throw new InvalidOperationException(
-                    $"Target disk ({operation.TargetDisk.SizeDisplay}) is smaller than source disk ({operation.SourceDisk.SizeDisplay}). " +
-                    $"Enable 'AllowSmallerTarget' to proceed (may fail).");
-            }
-        }
-
         // Check partitions to clone
         if (operation.PartitionsToClone.Count == 0)
             throw new InvalidOperationException("No partitions selected for cloning");
+
+        // Calculate total required space (including 1MB alignment gaps and overhead)
+        long totalSpaceRequired = 1024 * 1024; // Start with 1MB for MBR/GPT overhead
+        foreach (var p in operation.PartitionsToClone)
+        {
+            totalSpaceRequired += p.SizeBytes;
+            totalSpaceRequired += 1024 * 1024; // Add 1MB alignment buffer per partition
+        }
+
+        if (operation.TargetDisk.SizeBytes < totalSpaceRequired)
+        {
+            if (operation.AllowSmallerTarget)
+            {
+                _logger.Warning($"Target disk is smaller than source partition set. Implementing Magic Auto-Shrink.");
+                
+                // Keep Track of fixed-size partitions (EFI, MSR, Recovery)
+                long reservedSpace = 1024 * 1024; // MBR/GPT
+                foreach (var p in operation.PartitionsToClone)
+                {
+                    if (!p.IsSystemPartition)
+                    {
+                        reservedSpace += p.SizeBytes;
+                        reservedSpace += 1024 * 1024; // Alignment
+                    }
+                }
+
+                long availableForSystem = operation.TargetDisk.SizeBytes - reservedSpace - (1024 * 1024); // Extra 1MB safety
+                if (availableForSystem < (5L * 1024 * 1024 * 1024)) // Min 5GB
+                {
+                    throw new InvalidOperationException($"Target disk is too small even with shrinking. Only {FormatBytes(availableForSystem)} available for Windows.");
+                }
+
+                foreach (var p in operation.PartitionsToClone)
+                {
+                    if (p.IsSystemPartition)
+                    {
+                        p.TargetSizeBytes = availableForSystem;
+                        _logger.Info($"Auto-Shrink: System partition {p.PartitionNumber} will be shrunk from {p.SizeDisplay} to {FormatBytes(availableForSystem)}");
+                    }
+                    else p.TargetSizeBytes = p.SizeBytes;
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Target disk ({operation.TargetDisk.SizeDisplay}) is too small to fit the selected partitions. " +
+                    $"Total required space: {FormatBytes(totalSpaceRequired)}. " +
+                    "Check 'Allow smaller target disk' or deselect partitions.");
+            }
+        }
+        else
+        {
+            // Normal case: TargetSizeBytes = SizeBytes
+            foreach (var p in operation.PartitionsToClone) p.TargetSizeBytes = p.SizeBytes;
+        }
 
         // Verify boot partitions are included
         var hasEfi = operation.PartitionsToClone.Any(p => p.IsEfiPartition);
@@ -293,8 +337,24 @@ public class DiskClonerEngine
         // Step 2: Create partition table
         await CreatePartitionTableAsync(operation);
 
-        progress.StatusMessage = "Target disk prepared";
-        _logger.Info("Target disk prepared");
+        // Step 3: Refresh disk layout to make partitions visible
+        await RefreshDiskLayoutAsync(operation);
+
+        progress.StatusMessage = "Target disk prepared and partitioned";
+        _logger.Info("Target disk prepared and partitioned");
+    }
+
+    private string FormatBytes(long bytes)
+    {
+        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
+        int order = 0;
+        double size = bytes;
+        while (size >= 1024 && order < sizes.Length - 1)
+        {
+            order++;
+            size /= 1024;
+        }
+        return $"{size:0.##} {sizes[order]}";
     }
 
     /// <summary>
@@ -386,9 +446,10 @@ public class DiskClonerEngine
             // Align to 1MB boundary
             var alignedOffset = ((currentOffset + alignment - 1) / alignment) * alignment;
 
-            var sizeMB = partition.SizeBytes / (1024 * 1024);
-            var offsetMB = alignedOffset / 1024 / 1024;
-            scriptContent.AppendLine($"create partition primary size={sizeMB} offset={offsetMB}");
+            var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
+            var offsetKB = alignedOffset / 1024; // DiskPart offset is in KB
+            
+            scriptContent.AppendLine($"create partition primary size={sizeMB} offset={offsetKB}");
 
             // Set partition type/attributes if needed
             if (partition.IsEfiPartition)
@@ -397,11 +458,10 @@ public class DiskClonerEngine
             }
             else if (partition.IsSystemPartition)
             {
-                // Will be expanded later
                 scriptContent.AppendLine("format fs=ntfs quick");
             }
 
-            currentOffset = alignedOffset + partition.SizeBytes;
+            currentOffset = alignedOffset + partition.TargetSizeBytes;
         }
 
         // List partitions to verify
@@ -430,12 +490,17 @@ public class DiskClonerEngine
 
                 if (process.ExitCode != 0)
                 {
-                    _logger.Warning($"diskpart exited with code {process.ExitCode}: {error}");
+                    _logger.Error($"diskpart failed with code {process.ExitCode}. Output: {output} Error: {error}");
+                    throw new IOException($"Failed to create partitions: DiskPart error {process.ExitCode}. See logs for details.");
                 }
                 else
                 {
                     _logger.Info("Partitions created successfully");
                 }
+            }
+            else
+            {
+                throw new IOException("Failed to start diskpart.exe");
             }
         }
         finally
@@ -447,15 +512,15 @@ public class DiskClonerEngine
     /// <summary>
     /// Copies a single partition from source to target.
     /// </summary>
-    private async Task<long> CopyPartitionAsync(CloneOperation operation, PartitionInfo partition, CloneProgress progress)
+    private async Task<long> CopyPartitionAsync(CloneOperation operation, PartitionInfo partition, CloneProgress progress, long totalBytesAlreadyCopied)
     {
-        _logger.Info($"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay})");
+        _logger.Info($"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) to target ({FormatBytes(partition.TargetSizeBytes)})");
 
         var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
 
-        var bytesCopied = 0L;
-        var totalBytes = partition.SizeBytes;
+        var partitionBytesCopied = 0L;
+        var totalBytesInPartition = partition.TargetSizeBytes; // Truncate if Target is smaller
         var bufferSize = operation.IoBufferSize;
 
         await Task.Run(() =>
@@ -491,7 +556,7 @@ public class DiskClonerEngine
             var offset = partition.StartingOffset;
             var lastProgressUpdate = DateTime.UtcNow;
 
-            while (bytesCopied < totalBytes)
+            while (partitionBytesCopied < totalBytesInPartition)
             {
                 if (_cancellationTokenSource.Token.IsCancellationRequested)
                 {
@@ -499,7 +564,7 @@ public class DiskClonerEngine
                     break;
                 }
 
-                var bytesToRead = (int)Math.Min(bufferSize, totalBytes - bytesCopied);
+                var bytesToRead = (int)Math.Min(bufferSize, totalBytesInPartition - partitionBytesCopied);
 
                 // Seek to source position
                 if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
@@ -519,15 +584,16 @@ public class DiskClonerEngine
                 if (!WindowsApi.WriteFile(targetHandle, buffer, bytesRead, out bytesWritten, IntPtr.Zero))
                     throw new IOException($"Failed to write to target: {WindowsApi.GetLastErrorMessage()}");
 
-                bytesCopied += bytesRead;
+                partitionBytesCopied += bytesRead;
                 offset += bytesRead;
 
                 // Update progress periodically
-                if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(500))
+                if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(250)) // More frequent updates
                 {
-                    progress.BytesCopied += (long)bytesRead;
+                    var currentTotalCopied = totalBytesAlreadyCopied + partitionBytesCopied;
+                    progress.BytesCopied = currentTotalCopied;
                     progress.ThroughputBytesPerSec = bytesRead / (DateTime.UtcNow - lastProgressUpdate).TotalSeconds;
-                    progress.PercentComplete = (progress.BytesCopied * 100.0) / progress.TotalBytes;
+                    progress.PercentComplete = (currentTotalCopied * 100.0) / progress.TotalBytes;
 
                     var remainingBytes = progress.TotalBytes - progress.BytesCopied;
                     if (progress.ThroughputBytesPerSec > 0)
@@ -543,10 +609,10 @@ public class DiskClonerEngine
             // Flush target buffers
             WindowsApi.FlushFileBuffers(targetHandle);
 
-            _logger.Info($"Copied {bytesCopied:N0} bytes for partition {partition.PartitionNumber}");
+            _logger.Info($"Copied {partitionBytesCopied:N0} bytes for partition {partition.PartitionNumber}");
         });
 
-        return bytesCopied;
+        return totalBytesAlreadyCopied + partitionBytesCopied;
     }
 
     /// <summary>
@@ -985,7 +1051,9 @@ public class DiskClonerEngine
         sb.AppendLine("Partitions to Clone:");
         foreach (var partition in operation.PartitionsToClone)
         {
-            sb.AppendLine($"  {partition}");
+            var role = partition.GetTypeName();
+            var label = string.IsNullOrEmpty(partition.VolumeLabel) ? "" : $" [{partition.VolumeLabel}]";
+            sb.AppendLine($"  [{partition.PartitionNumber}] {role}{label} - {partition.SizeDisplay}");
         }
         sb.AppendLine();
         sb.AppendLine("Options:");

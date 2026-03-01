@@ -4,6 +4,8 @@ using DiskCloner.Core.Services;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 
 namespace DiskCloner.UI;
 
@@ -20,6 +22,20 @@ public partial class MainWindow : Window
     private List<PartitionInfo> _allPartitions = new();
     private CloneOperation? _currentOperation;
     private bool _isCloning;
+
+    // Concrete types for safer UI binding
+    public class DiskDisplayItem
+    {
+        public int DiskNumber { get; set; }
+        public string DisplayText { get; set; } = string.Empty;
+    }
+
+    public class PartitionDisplayItem
+    {
+        public int PartitionNumber { get; set; }
+        public string DisplayText { get; set; } = string.Empty;
+        public bool IsSelected { get; set; } = true;
+    }
 
     public MainWindow()
     {
@@ -126,18 +142,18 @@ public partial class MainWindow : Window
         TargetDiskComboBox.ItemsSource = null;
 
         var sourceItems = _availableDisks
-            .Select(d => new
+            .Select(d => new DiskDisplayItem
             {
-                d.DiskNumber,
+                DiskNumber = d.DiskNumber,
                 DisplayText = $"Disk {d.DiskNumber}: {d.FriendlyName} ({d.SizeDisplay}){(d.IsSystemDisk ? " [SYSTEM]" : "")}"
             })
             .ToList();
 
         var targetItems = _availableDisks
             .Where(d => !d.IsSystemDisk && d.IsOnline && !d.IsReadOnly)
-            .Select(d => new
+            .Select(d => new DiskDisplayItem
             {
-                d.DiskNumber,
+                DiskNumber = d.DiskNumber,
                 DisplayText = $"Disk {d.DiskNumber}: {d.FriendlyName} ({d.SizeDisplay}){(d.IsRemovable ? " [USB]" : "")}"
             })
             .ToList();
@@ -149,9 +165,9 @@ public partial class MainWindow : Window
     private void UpdatePartitionsList()
     {
         var partitionItems = _allPartitions
-            .Select(p => new
+            .Select(p => new PartitionDisplayItem
             {
-                IsSelected = true, // Default select all boot-required partitions
+                PartitionNumber = p.PartitionNumber,
                 DisplayText = $"[{p.PartitionNumber}] {p.GetTypeName()}: {p.SizeDisplay}{(p.DriveLetter.HasValue ? $" ({p.DriveLetter.Value}:)" : "")}"
             })
             .ToList();
@@ -161,20 +177,18 @@ public partial class MainWindow : Window
 
     private void UpdateSummary()
     {
-        if (SourceDiskComboBox.SelectedItem is { } sourceItem)
+        if (SourceDiskComboBox.SelectedItem is DiskDisplayItem src)
         {
-            dynamic src = sourceItem;
-            SummarySourceTextBlock.Text = $"Source: Disk {src.DiskNumber} - {src.DisplayText}";
+            SummarySourceTextBlock.Text = $"Source: {src.DisplayText}";
         }
         else
         {
             SummarySourceTextBlock.Text = "Source: Not selected";
         }
 
-        if (TargetDiskComboBox.SelectedItem is { } targetItem)
+        if (TargetDiskComboBox.SelectedItem is DiskDisplayItem tgt)
         {
-            dynamic tgt = targetItem;
-            SummaryTargetTextBlock.Text = $"Target: Disk {tgt.DiskNumber} - {tgt.DisplayText}";
+            SummaryTargetTextBlock.Text = $"Target: {tgt.DisplayText}";
         }
         else
         {
@@ -268,7 +282,13 @@ public partial class MainWindow : Window
         // Show progress UI
         ProgressBorder.Visibility = Visibility.Visible;
         ResultsBorder.Visibility = Visibility.Collapsed;
-        MainTabControl.IsEnabled = false;
+        
+        // Instead of disabling the whole TabControl (which kills scrollbars), 
+        // we disable specific interactive elements.
+        SetInteractiveElementsEnabled(false);
+        
+        // Scroll progress into view
+        ProgressBorder.BringIntoView();
 
         CloneResult cloneResult;
 
@@ -290,7 +310,7 @@ public partial class MainWindow : Window
         {
             _isCloning = false;
             _clonerEngine.ProgressUpdate -= OnProgressUpdate;
-            MainTabControl.IsEnabled = true;
+            SetInteractiveElementsEnabled(true);
         }
 
         // Show results
@@ -299,7 +319,8 @@ public partial class MainWindow : Window
 
     private void OnProgressUpdate(CloneProgress progress)
     {
-        Dispatcher.Invoke(() =>
+        // Use BeginInvoke to prevent blocking the cloning thread
+        Dispatcher.BeginInvoke(() =>
         {
             StageTextBlock.Text = progress.StatusMessage;
             ProgressBar.Value = progress.PercentComplete;
@@ -322,6 +343,42 @@ public partial class MainWindow : Window
                 _logger?.Error($"Progress error: {progress.LastError}");
             }
         });
+    }
+
+    private void SetInteractiveElementsEnabled(bool enabled)
+    {
+        SourceDiskComboBox.IsEnabled = enabled;
+        TargetDiskComboBox.IsEnabled = enabled;
+        PartitionsListBox.IsEnabled = enabled;
+        UseVssCheckBox.IsEnabled = enabled;
+        VerifyIntegrityCheckBox.IsEnabled = enabled;
+        FullHashCheckBox.IsEnabled = enabled;
+        AutoExpandCheckBox.IsEnabled = enabled;
+        AllowSmallerTargetCheckBox.IsEnabled = enabled;
+        BufferSizeComboBox.IsEnabled = enabled;
+        PreviewButton.IsEnabled = enabled;
+        ConfirmationTextBox.IsEnabled = enabled;
+        CloneButton.IsEnabled = enabled ? (ConfirmationTextBox.Text.Trim().ToUpper() == "CLONE") : false;
+        
+        // Disable "Refresh Disks" buttons (they don't have names, so we'll find them)
+        foreach (var child in FindVisualChildren<Button>(this))
+        {
+            if (child.Content?.ToString() == "Refresh Disks")
+            {
+                child.IsEnabled = enabled;
+            }
+        }
+    }
+
+    private static IEnumerable<T> FindVisualChildren<T>(DependencyObject depObj) where T : DependencyObject
+    {
+        if (depObj == null) yield break;
+        for (int i = 0; i < System.Windows.Media.VisualTreeHelper.GetChildrenCount(depObj); i++)
+        {
+            DependencyObject child = System.Windows.Media.VisualTreeHelper.GetChild(depObj, i);
+            if (child is T t) yield return t;
+            foreach (T childOfChild in FindVisualChildren<T>(child)) yield return childOfChild;
+        }
     }
 
     private void ShowResults(CloneResult result)
@@ -462,6 +519,17 @@ public partial class MainWindow : Window
                 return false;
         }
 
+        // Check for administrator privileges
+        if (!IsAdministrator())
+        {
+            MessageBox.Show(
+                "This application requires administrator privileges.\n\n" +
+                "Please run as administrator and try again.",
+                "Administrator Required",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            return false;
+        }
         // Safety check: target must not be system disk
         if (targetDisk.IsSystemDisk)
         {
@@ -512,16 +580,15 @@ public partial class MainWindow : Window
         }
 
         // Get selected partitions
-        if (PartitionsListBox.ItemsSource is { } partitions)
+        if (PartitionsListBox.ItemsSource is IEnumerable<PartitionDisplayItem> partitions)
         {
             var allPartitions = sourceDisk.Partitions.ToList();
 
-            foreach (dynamic item in partitions)
+            foreach (var item in partitions)
             {
                 if (item.IsSelected)
                 {
-                    var partitionIndex = int.Parse(System.Text.RegularExpressions.Regex.Match(item.DisplayText, @"\[(\d+)\]").Groups[1].Value);
-                    var partition = allPartitions.FirstOrDefault(p => p.PartitionNumber == partitionIndex);
+                    var partition = allPartitions.FirstOrDefault(p => p.PartitionNumber == item.PartitionNumber);
                     if (partition != null)
                     {
                         operation.PartitionsToClone.Add(partition);
@@ -571,5 +638,19 @@ public partial class MainWindow : Window
         if (ts.TotalMinutes >= 1)
             return $"{ts.Minutes}m {ts.Seconds}s";
         return $"{ts.Seconds}s";
+    }
+
+    private static bool IsAdministrator()
+    {
+        try
+        {
+            using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(identity);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

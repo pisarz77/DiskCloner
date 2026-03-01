@@ -15,6 +15,12 @@ public class DiskEnumerator
     private readonly List<DiskInfo> _cachedDisks = new();
     private DateTime _lastCacheTime = DateTime.MinValue;
     private readonly TimeSpan _cacheDuration = TimeSpan.FromSeconds(5);
+    
+    private string? _systemDriveLetter;
+    private string? _systemPartitionDeviceID;
+    private long _systemPartitionOffset = -1;
+    private int _systemDiskNumber = -1;
+    private bool _isInitialized = false;
 
     public DiskEnumerator(ILogger logger)
     {
@@ -26,6 +32,11 @@ public class DiskEnumerator
     /// </summary>
     public async Task<List<DiskInfo>> GetDisksAsync(bool forceRefresh = false)
     {
+        if (!_isInitialized)
+        {
+            await InitializeSystemInfoAsync();
+        }
+
         if (!forceRefresh && DateTime.UtcNow - _lastCacheTime < _cacheDuration)
         {
             _logger.Debug("Returning cached disk information");
@@ -37,11 +48,10 @@ public class DiskEnumerator
         try
         {
             var disks = await QueryDisksViaWmiAsync();
-            var systemDiskNumber = await GetSystemDiskNumberAsync();
 
             foreach (var disk in disks)
             {
-                disk.IsSystemDisk = (disk.DiskNumber == systemDiskNumber);
+                disk.IsSystemDisk = (disk.DiskNumber == _systemDiskNumber);
                 _logger.Info($"Found Disk {disk.DiskNumber}: {disk.FriendlyName} ({disk.SizeDisplay}) {(disk.IsSystemDisk ? "[SYSTEM]" : "")}");
             }
 
@@ -106,47 +116,50 @@ public class DiskEnumerator
 
                 foreach (ManagementObject diskObj in results)
                 {
-                    try
+                    using (diskObj)
                     {
-                        // Safely get basic properties first
-                        int diskNumber = GetInt32OrDefault(SafeGetProperty(diskObj, "Index"));
-                        string model = SafeGetProperty(diskObj, "Model")?.ToString() ?? "Unknown Disk";
-                        long size = GetInt64OrDefault(SafeGetProperty(diskObj, "Size"));
-
-                        var disk = new DiskInfo
+                        try
                         {
-                            DiskNumber = diskNumber,
-                            FriendlyName = model,
-                            SizeBytes = size,
-                            IsOnline = true
-                        };
+                            // Safely get basic properties first
+                            int diskNumber = GetInt32OrDefault(SafeGetProperty(diskObj, "Index"));
+                            string model = SafeGetProperty(diskObj, "Model")?.ToString() ?? "Unknown Disk";
+                            long size = GetInt64OrDefault(SafeGetProperty(diskObj, "Size"));
 
-                        // Optional properties with individual protection
-                        string status = SafeGetProperty(diskObj, "Status")?.ToString() ?? "";
-                        disk.IsOnline = string.IsNullOrEmpty(status) || status.Equals("OK", StringComparison.OrdinalIgnoreCase);
+                            var disk = new DiskInfo
+                            {
+                                DiskNumber = diskNumber,
+                                FriendlyName = model,
+                                SizeBytes = size,
+                                IsOnline = true
+                            };
 
-                        string mediaType = SafeGetProperty(diskObj, "MediaType")?.ToString() ?? "";
-                        string interfaceType = SafeGetProperty(diskObj, "InterfaceType")?.ToString() ?? "";
-                        
-                        disk.IsRemovable = mediaType.Contains("removable", StringComparison.OrdinalIgnoreCase) ||
-                                         interfaceType.Contains("usb", StringComparison.OrdinalIgnoreCase);
+                            // Optional properties with individual protection
+                            string status = SafeGetProperty(diskObj, "Status")?.ToString() ?? "";
+                            disk.IsOnline = string.IsNullOrEmpty(status) || status.Equals("OK", StringComparison.OrdinalIgnoreCase);
 
-                        disk.BusType = DetermineBusType(interfaceType, mediaType);
+                            string mediaType = SafeGetProperty(diskObj, "MediaType")?.ToString() ?? "";
+                            string interfaceType = SafeGetProperty(diskObj, "InterfaceType")?.ToString() ?? "";
 
-                        disk.PhysicalSectorSize = GetInt32OrDefault(SafeGetProperty(diskObj, "BytesPerSector"), 512);
-                        disk.LogicalSectorSize = disk.PhysicalSectorSize;
+                            disk.IsRemovable = mediaType.Contains("removable", StringComparison.OrdinalIgnoreCase) ||
+                                             interfaceType.Contains("usb", StringComparison.OrdinalIgnoreCase);
 
-                        disk.IsGpt = DeterminePartitionStyle(diskObj);
-                        disk.TotalSectors = disk.SizeBytes > 0 ? disk.SizeBytes / disk.PhysicalSectorSize : 0;
+                            disk.BusType = DetermineBusType(interfaceType, mediaType);
 
-                        // Partitions can be queried separately
-                        disk.Partitions = await QueryPartitionsForDisk(disk.DiskNumber);
+                            disk.PhysicalSectorSize = GetInt32OrDefault(SafeGetProperty(diskObj, "BytesPerSector"), 512);
+                            disk.LogicalSectorSize = disk.PhysicalSectorSize;
 
-                        disks.Add(disk);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Warning($"Failed to process specific disk entry: {ex.Message}");
+                            disk.IsGpt = DeterminePartitionStyle(diskObj);
+                            disk.TotalSectors = disk.SizeBytes > 0 ? disk.SizeBytes / disk.PhysicalSectorSize : 0;
+
+                            // Partitions can be queried separately
+                            disk.Partitions = await QueryPartitionsForDisk(disk.DiskNumber);
+
+                            disks.Add(disk);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.Warning($"Failed to process specific disk entry: {ex.Message}");
+                        }
                     }
                 }
             });
@@ -279,35 +292,40 @@ public class DiskEnumerator
 
                 foreach (ManagementObject partitionObj in results)
                 {
-                    try
+                    using (partitionObj)
                     {
-                        var partition = new PartitionInfo
+                        try
                         {
-                            PartitionNumber = GetInt32OrDefault(SafeGetProperty(partitionObj, "Index")) + 1,
-                            StartingOffset = GetInt64OrDefault(SafeGetProperty(partitionObj, "StartingOffset")),
-                            SizeBytes = GetInt64OrDefault(SafeGetProperty(partitionObj, "Size")),
-                            IsActive = GetBoolOrDefault(SafeGetProperty(partitionObj, "Bootable")) ||
-                                       GetBoolOrDefault(SafeGetProperty(partitionObj, "PrimaryPartition"))
-                        };
+                            var partition = new PartitionInfo
+                            {
+                                PartitionNumber = GetInt32OrDefault(SafeGetProperty(partitionObj, "Index")) + 1,
+                                StartingOffset = GetInt64OrDefault(SafeGetProperty(partitionObj, "StartingOffset")),
+                                SizeBytes = GetInt64OrDefault(SafeGetProperty(partitionObj, "Size")),
+                                IsActive = GetBoolOrDefault(SafeGetProperty(partitionObj, "Bootable")) ||
+                                           GetBoolOrDefault(SafeGetProperty(partitionObj, "PrimaryPartition"))
+                            };
 
-                        // Get logical disks for this partition
-                        var logicalDisks = GetLogicalDisksForPartition(diskNumber, partition.PartitionNumber - 1);
-                        if (logicalDisks.Any())
-                        {
-                            var logical = logicalDisks.First();
-                            partition.DriveLetter = logical.VolumeId != null && logical.VolumeId.Length > 0 ? logical.VolumeId[0] : (char?)null;
-                            partition.FileSystemType = logical.FileSystem ?? "RAW";
-                            partition.VolumeLabel = logical.VolumeName ?? "";
+                            string wmiType = SafeGetProperty(partitionObj, "Type")?.ToString() ?? "";
+
+                            // Get logical disks for this partition
+                            var logicalDisks = GetLogicalDisksForPartition(diskNumber, partition.PartitionNumber - 1);
+                            if (logicalDisks.Any())
+                            {
+                                var logical = logicalDisks.First();
+                                partition.DriveLetter = logical.VolumeId != null && logical.VolumeId.Length > 0 ? logical.VolumeId[0] : (char?)null;
+                                partition.FileSystemType = logical.FileSystem ?? "RAW";
+                                partition.VolumeLabel = logical.VolumeName ?? "";
+                            }
+
+                            // Determine partition type/role
+                            DeterminePartitionType(partition, wmiType, SafeGetProperty(partitionObj, "DeviceID")?.ToString());
+
+                            partitions.Add(partition);
                         }
-
-                        // Determine partition type/role
-                        DeterminePartitionType(partition, diskNumber);
-
-                        partitions.Add(partition);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Warning($"Failed to process partition: {ex.Message}");
+                        catch (Exception ex)
+                        {
+                            _logger.Warning($"Failed to process partition: {ex.Message}");
+                        }
                     }
                 }
             });
@@ -320,6 +338,103 @@ public class DiskEnumerator
         return partitions.OrderBy(p => p.StartingOffset).ToList();
     }
 
+    private async Task InitializeSystemInfoAsync()
+    {
+        try
+        {
+            await Task.Run(() =>
+            {
+                // 1. Get SystemDrive from Win32_OperatingSystem
+                using var osSearcher = new ManagementObjectSearcher("SELECT SystemDrive FROM Win32_OperatingSystem");
+                foreach (ManagementObject os in osSearcher.Get())
+                {
+                    _systemDriveLetter = os["SystemDrive"]?.ToString()?.Trim(':');
+                    break;
+                }
+
+                if (string.IsNullOrEmpty(_systemDriveLetter)) _systemDriveLetter = "C";
+
+                // 2. Trace back to hardware via P/Invoke (Most reliable: Offset-based)
+                try
+                {
+                    var drivePath = $@"\\.\{_systemDriveLetter}:";
+                    using var hVolume = WindowsApi.CreateFile(
+                        drivePath,
+                        WindowsApi.GENERIC_READ,
+                        WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
+                        IntPtr.Zero,
+                        WindowsApi.OPEN_EXISTING,
+                        0,
+                        IntPtr.Zero);
+
+                    if (!hVolume.IsInvalid)
+                    {
+                        var size = Marshal.SizeOf<WindowsApi.VOLUME_DISK_EXTENTS>();
+                        IntPtr buffer = Marshal.AllocHGlobal(size);
+                        try
+                        {
+                            uint bytesReturned;
+                            if (WindowsApi.DeviceIoControl(
+                                hVolume,
+                                WindowsApi.IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                                IntPtr.Zero, 0,
+                                buffer, size,
+                                out bytesReturned,
+                                IntPtr.Zero))
+                            {
+                                var extents = Marshal.PtrToStructure<WindowsApi.VOLUME_DISK_EXTENTS>(buffer);
+                                if (extents.NumberOfDiskExtents > 0)
+                                {
+                                    _systemPartitionOffset = extents.Extents[0].StartingOffset;
+                                    _systemDiskNumber = (int)extents.Extents[0].DiskNumber;
+                                }
+                            }
+                        }
+                        finally { Marshal.FreeHGlobal(buffer); }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning($"P/Invoke system trace failed: {ex.Message}");
+                }
+
+                // 3. Fallback: Trace back via WMI associations
+                if (_systemPartitionOffset == -1)
+                {
+                    using var ldSearcher = new ManagementObjectSearcher($"SELECT * FROM Win32_LogicalDisk WHERE DeviceID = '{_systemDriveLetter}:'");
+                    foreach (ManagementObject ld in ldSearcher.Get())
+                    {
+                        using (ld)
+                        {
+                            foreach (ManagementObject partition in ld.GetRelated("Win32_DiskPartition"))
+                            {
+                                using (partition)
+                                {
+                                    _systemPartitionDeviceID = SafeGetProperty(partition, "DeviceID")?.ToString();
+                                    _systemPartitionOffset = GetInt64OrDefault(SafeGetProperty(partition, "StartingOffset"), -1);
+                                    _systemDiskNumber = GetInt32OrDefault(SafeGetProperty(partition, "DiskIndex"), -1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback for disk number if tracing failed
+                if (_systemDiskNumber == -1) _systemDiskNumber = 0;
+                
+                _isInitialized = true;
+                _logger.Info($"System detected: Drive {_systemDriveLetter}: at Offset {_systemPartitionOffset} (Disk {_systemDiskNumber})");
+            });
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning($"System info initialization failed: {ex.Message}");
+            _systemDiskNumber = 0;
+            _isInitialized = true;
+        }
+    }
+
     /// <summary>
     /// Gets logical disk information for a partition.
     /// </summary>
@@ -329,13 +444,44 @@ public class DiskEnumerator
 
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT * FROM Win32_LogicalDiskToPartition");
+            // Use Win32_DiskPartition.DeviceID to get related logical disks
+            string deviceId = $"Disk #{diskNumber}, Partition #{partitionIndex}";
+            using var partition = new ManagementObject($"Win32_DiskPartition.DeviceID='{deviceId}'");
+            
+            foreach (ManagementObject logical in partition.GetRelated("Win32_LogicalDisk"))
+            {
+                using (logical)
+                {
+                    var driveLetterStr = SafeGetProperty(logical, "DeviceID")?.ToString()?.Trim(':') ?? "";
+                    if (driveLetterStr.Length == 1)
+                    {
+                        var volumeInfo = GetVolumeInfo(driveLetterStr[0]);
+                        logicalDisks.Add(volumeInfo);
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning($"Failed to query logical disks via related: {ex.Message}. Falling back to list scan.");
+            // Fallback to the slower scan if the specific object doesn't exist (e.g. invalid DeviceID)
+            return GetLogicalDisksForPartitionFallback(diskNumber, partitionIndex);
+        }
+
+        return logicalDisks;
+    }
+
+    private List<dynamic> GetLogicalDisksForPartitionFallback(int diskNumber, int partitionIndex)
+    {
+        var logicalDisks = new List<dynamic>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_LogicalDiskToPartition");
             using var results = searcher.Get();
 
             foreach (ManagementObject link in results)
             {
-                try
+                using (link)
                 {
                     var antecedent = SafeGetProperty(link, "Antecedent")?.ToString() ?? "";
                     var dependent = SafeGetProperty(link, "Dependent")?.ToString() ?? "";
@@ -343,25 +489,17 @@ public class DiskEnumerator
                     if (antecedent.Contains($"Disk #{diskNumber}") &&
                         antecedent.Contains($"Partition #{partitionIndex}"))
                     {
-                        // Extract drive letter
-                        var match = System.Text.RegularExpressions.Regex.Match(
-                            dependent, @"Win32_LogicalDisk\s*=\s*""([A-Z]):""");
+                        var match = System.Text.RegularExpressions.Regex.Match(dependent, @"Win32_LogicalDisk\.DeviceID\s*=\s*""([A-Z]):""");
                         if (match.Success)
                         {
                             var driveLetter = match.Groups[1].Value[0];
-                            var volumeInfo = GetVolumeInfo(driveLetter);
-                            logicalDisks.Add(volumeInfo);
+                            logicalDisks.Add(GetVolumeInfo(driveLetter));
                         }
                     }
                 }
-                catch { }
             }
         }
-        catch (Exception ex)
-        {
-            _logger.Warning($"Failed to query logical disks: {ex.Message}");
-        }
-
+        catch { }
         return logicalDisks;
     }
 
@@ -378,15 +516,18 @@ public class DiskEnumerator
 
             foreach (ManagementObject disk in results)
             {
-                return new
+                using (disk)
                 {
-                    VolumeId = new[] { driveLetter },
-                    FileSystem = SafeGetProperty(disk, "FileSystem")?.ToString(),
-                    VolumeName = SafeGetProperty(disk, "VolumeName")?.ToString(),
-                    VolumeSerialNumber = SafeGetProperty(disk, "VolumeSerialNumber")?.ToString(),
-                    Size = GetInt64OrDefault(SafeGetProperty(disk, "Size")),
-                    FreeSpace = GetInt64OrDefault(SafeGetProperty(disk, "FreeSpace"))
-                };
+                    return new
+                    {
+                        VolumeId = new[] { driveLetter },
+                        FileSystem = SafeGetProperty(disk, "FileSystem")?.ToString(),
+                        VolumeName = SafeGetProperty(disk, "VolumeName")?.ToString(),
+                        VolumeSerialNumber = SafeGetProperty(disk, "VolumeSerialNumber")?.ToString(),
+                        Size = GetInt64OrDefault(SafeGetProperty(disk, "Size")),
+                        FreeSpace = GetInt64OrDefault(SafeGetProperty(disk, "FreeSpace"))
+                    };
+                }
             }
         }
         catch { }
@@ -455,95 +596,77 @@ public class DiskEnumerator
     /// <summary>
     /// Determines the type/role of a partition (EFI, System, MSR, Recovery, etc.).
     /// </summary>
-    private void DeterminePartitionType(PartitionInfo partition, int diskNumber)
+    private void DeterminePartitionType(PartitionInfo partition, string wmiType, string? deviceId)
     {
-        // Check if this is the Windows system partition (typically C:)
-        if (partition.DriveLetter == 'C')
+        // 1. Check if this is exactly the Windows system partition (traced via Offset or DeviceID)
+        if ((_systemPartitionOffset != -1 && partition.StartingOffset == _systemPartitionOffset) ||
+            (!string.IsNullOrEmpty(_systemPartitionDeviceID) && deviceId == _systemPartitionDeviceID))
         {
             partition.IsSystemPartition = true;
         }
 
-        // Check for EFI partition (usually 100-300MB, FAT32, no drive letter, starts at 1MB)
-        if (partition.SizeBytes >= 100 * 1024 * 1024 &&
-            partition.SizeBytes <= 600 * 1024 * 1024 &&
-            partition.FileSystemType.Equals("FAT32", StringComparison.OrdinalIgnoreCase) &&
-            (partition.DriveLetter == null || partition.DriveLetter < 'A' || partition.DriveLetter > 'Z') &&
-            partition.StartingOffset >= 1024 * 1024 &&
-            partition.StartingOffset < 10 * 1024 * 1024)
+        // 2. Explicit WMI Type check (GPT-specific types from Win32_DiskPartition.Type)
+        if (wmiType.Contains("System", StringComparison.OrdinalIgnoreCase) || 
+            wmiType.Contains("EFI", StringComparison.OrdinalIgnoreCase))
         {
             partition.IsEfiPartition = true;
         }
-
-        // Check for MSR partition (usually 16MB or 128MB, no filesystem, no drive letter)
-        if ((partition.SizeBytes == 16 * 1024 * 1024 ||
-             partition.SizeBytes == 128 * 1024 * 1024) &&
-            string.IsNullOrEmpty(partition.FileSystemType) &&
-            partition.DriveLetter == null)
+        else if (wmiType.Contains("Reserved", StringComparison.OrdinalIgnoreCase) || 
+                 wmiType.Contains("MSR", StringComparison.OrdinalIgnoreCase))
         {
             partition.IsMsrPartition = true;
         }
-
-        // Check for recovery partition (common sizes: 450MB, 500MB, 1GB, etc.)
-        if ((partition.SizeBytes == 450 * 1024 * 1024 ||
-             partition.SizeBytes == 500 * 1024 * 1024 ||
-             partition.SizeBytes == 1024 * 1024 * 1024) &&
-            !partition.IsEfiPartition &&
-            !partition.IsSystemPartition &&
-            !partition.IsMsrPartition)
+        else if (wmiType.Contains("Recovery", StringComparison.OrdinalIgnoreCase))
         {
             partition.IsRecoveryPartition = true;
+        }
+        
+        // 3. Fallback check for drive letter (typically C:)
+        if (!partition.IsSystemPartition && partition.DriveLetter.HasValue)
+        {
+            if (partition.DriveLetter == 'C' || partition.DriveLetter.ToString().Equals(_systemDriveLetter, StringComparison.OrdinalIgnoreCase))
+            {
+                partition.IsSystemPartition = true;
+            }
+        }
+
+        // 3. Fallback heuristics if WMI type is generic ("GPT: Basic Data" or "Unknown")
+        if (!partition.IsEfiPartition && !partition.IsMsrPartition && !partition.IsRecoveryPartition && !partition.IsSystemPartition)
+        {
+            // Likely EFI (around 100MB, often FAT32 or RAW, near start of disk)
+            if (partition.SizeBytes >= 90 * 1024 * 1024 &&
+                partition.SizeBytes <= 600 * 1024 * 1024 &&
+                (partition.DriveLetter == null) &&
+                partition.StartingOffset < 1024 * 1024 * 1024) // Within first 1GB
+            {
+                // If index is 0 or 1, very likely EFI
+                partition.IsEfiPartition = true;
+            }
+            // Likely MSR (16MB or 128MB, no filesystem, no drive letter)
+            else if ((partition.SizeBytes == 16 * 1024 * 1024 || partition.SizeBytes == 128 * 1024 * 1024) &&
+                     string.IsNullOrEmpty(partition.FileSystemType) &&
+                     partition.DriveLetter == null)
+            {
+                partition.IsMsrPartition = true;
+            }
+            // Likely Recovery (400MB-2GB, no drive letter)
+            else if (partition.SizeBytes >= 400 * 1024 * 1024 && 
+                     partition.SizeBytes <= 2 * 1024L * 1024 * 1024 &&
+                     partition.DriveLetter == null)
+            {
+                partition.IsRecoveryPartition = true;
+            }
         }
     }
 
     /// <summary>
     /// Gets the system disk number using WMI.
     /// </summary>
+    [Obsolete("Use _systemDiskNumber initialized by InitializeSystemInfoAsync")]
     private async Task<int> GetSystemDiskNumberAsync()
     {
-        try
-        {
-            return await Task.Run(() =>
-            {
-                // Method 1: Use Win32_DiskDrive directly by checking for the boot partition
-                // This is often more reliable than complex joins.
-                try
-                {
-                    using var searcher = new ManagementObjectSearcher(
-                        "SELECT * FROM Win32_DiskDrive WHERE Index = 0");
-                    using var results = searcher.Get();
-                    
-                    foreach (ManagementObject disk in results)
-                    {
-                        var capabilities = SafeGetProperty(disk, "Capabilities") as ushort[];
-                        if (capabilities != null && capabilities.Contains((ushort)4)) // 4 = Supports Boot
-                        {
-                            return 0; 
-                        }
-                    }
-                }
-                catch { }
-
-                // Method 2: Query operating system for SystemDrive
-                try
-                {
-                    using var osSearcher = new ManagementObjectSearcher("SELECT SystemDrive FROM Win32_OperatingSystem");
-                    foreach (ManagementObject os in osSearcher.Get())
-                    {
-                        var systemDrive = os["SystemDrive"]?.ToString() ?? "C:";
-                        // Finding which disk owns "C:" is non-trivial in WMI without a lot of queries.
-                        // We'll trust the first disk found with partitions as a fallback if disk 0 fails.
-                    }
-                }
-                catch { }
-
-                return 0; // Default to disk 0 as it's almost always the system disk
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.Warning($"Failed to get system disk number: {ex.Message}, defaulting to 0");
-            return 0;
-        }
+        if (!_isInitialized) await InitializeSystemInfoAsync();
+        return _systemDiskNumber;
     }
 
     /// <summary>
