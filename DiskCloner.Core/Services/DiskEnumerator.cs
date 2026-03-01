@@ -1,7 +1,6 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
-using Microsoft.Win32.SafeHandles;
 using System.Management;
 using System.Runtime.InteropServices;
 
@@ -109,27 +108,28 @@ public class DiskEnumerator
                 {
                     try
                     {
+                        var mediaType = diskObj["MediaType"]?.ToString() ?? string.Empty;
+                        var interfaceType = diskObj["InterfaceType"]?.ToString() ?? string.Empty;
+                        var status = diskObj["Status"]?.ToString() ?? string.Empty;
+
                         var disk = new DiskInfo
                         {
-                            DiskNumber = Convert.ToInt32(diskObj["Index"]),
+                            DiskNumber = GetInt32OrDefault(diskObj["Index"]),
                             FriendlyName = diskObj["Model"]?.ToString() ?? "Unknown Disk",
-                            SizeBytes = Convert.ToInt64(diskObj["Size"]),
-                            IsOnline = Convert.ToBoolean(diskObj["Status"]) ||
-                                       diskObj["Status"]?.ToString()?.ToLowerInvariant() == "ok",
-                            IsReadOnly = Convert.ToBoolean(diskObj["ReadOnly"]) ||
-                                         diskObj["MediaType"]?.ToString()?.ToLowerInvariant().Contains("read only") == true
+                            SizeBytes = GetInt64OrDefault(diskObj["Size"]),
+                            IsOnline = GetBoolOrDefault(diskObj["Status"], status.Equals("OK", StringComparison.OrdinalIgnoreCase)),
+                            IsReadOnly = GetBoolOrDefault(diskObj["ReadOnly"]) ||
+                                         mediaType.Contains("read only", StringComparison.OrdinalIgnoreCase)
                         };
 
                         // Determine if removable (usually USB)
-                        var mediaType = diskObj["MediaType"]?.ToString() ?? "";
-                        var interfaceType = diskObj["InterfaceType"]?.ToString() ?? "";
-                        disk.IsRemovable = mediaType.ToLowerInvariant().Contains("removable") ||
-                                           interfaceType.ToLowerInvariant().Contains("usb");
+                        disk.IsRemovable = mediaType.Contains("removable", StringComparison.OrdinalIgnoreCase) ||
+                                           interfaceType.Contains("usb", StringComparison.OrdinalIgnoreCase);
 
                         disk.BusType = DetermineBusType(diskObj);
 
                         // Get sector sizes
-                        disk.PhysicalSectorSize = Convert.ToInt32(diskObj["BytesPerSector"]);
+                        disk.PhysicalSectorSize = GetInt32OrDefault(diskObj["BytesPerSector"], 512);
                         disk.LogicalSectorSize = disk.PhysicalSectorSize; // Assume same unless we query further
 
                         // Determine partition style (GPT vs MBR)
@@ -157,6 +157,77 @@ public class DiskEnumerator
         }
 
         return disks;
+    }
+
+    private static bool GetBoolOrDefault(object? value, bool defaultValue = false)
+    {
+        if (value == null || value == DBNull.Value)
+            return defaultValue;
+
+        if (value is bool boolean)
+            return boolean;
+
+        if (value is string text)
+        {
+            if (bool.TryParse(text, out var parsed))
+                return parsed;
+
+            if (text.Equals("ok", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("online", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("1", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("yes", StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (text.Equals("offline", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("0", StringComparison.OrdinalIgnoreCase) ||
+                text.Equals("no", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return defaultValue;
+        }
+
+        try
+        {
+            return Convert.ToBoolean(value);
+        }
+        catch
+        {
+            return defaultValue;
+        }
+    }
+
+    private static int GetInt32OrDefault(object? value, int defaultValue = 0)
+    {
+        if (value == null || value == DBNull.Value)
+            return defaultValue;
+
+        try
+        {
+            return Convert.ToInt32(value);
+        }
+        catch
+        {
+            return defaultValue;
+        }
+    }
+
+    private static long GetInt64OrDefault(object? value, long defaultValue = 0)
+    {
+        if (value == null || value == DBNull.Value)
+            return defaultValue;
+
+        try
+        {
+            return Convert.ToInt64(value);
+        }
+        catch
+        {
+            return defaultValue;
+        }
     }
 
     /// <summary>
@@ -454,7 +525,7 @@ public class DiskEnumerator
             var path = $@"\\.\PhysicalDrive{diskNumber}";
             var result = await Task.Run<bool>(() =>
             {
-                var handlePtr = WindowsApi.CreateFile(
+                using var handle = WindowsApi.CreateFile(
                     path,
                     WindowsApi.GENERIC_READ,
                     WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
@@ -463,8 +534,6 @@ public class DiskEnumerator
                     0,
                     IntPtr.Zero);
 
-                var handle = new SafeFileHandle(handlePtr, true);
-
                 if (handle.IsInvalid)
                 {
                     var error = WindowsApi.GetLastError();
@@ -472,40 +541,33 @@ public class DiskEnumerator
                     return false;
                 }
 
+                // Try to get geometry
+                var size = Marshal.SizeOf<WindowsApi.DISK_GEOMETRY>();
+                var buffer = Marshal.AllocHGlobal(size);
+
                 try
                 {
-                    // Try to get geometry
-                    var size = Marshal.SizeOf<WindowsApi.DISK_GEOMETRY>();
-                    var buffer = Marshal.AllocHGlobal(size);
+                    uint bytesReturned;
+                    bool result = WindowsApi.DeviceIoControl(
+                        handle,
+                        WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                        IntPtr.Zero,
+                        0,
+                        buffer,
+                        size,
+                        out bytesReturned,
+                        IntPtr.Zero);
 
-                    try
+                    if (!result)
                     {
-                        uint bytesReturned;
-                        bool result = WindowsApi.DeviceIoControl(
-                            handle.DangerousGetHandle(),
-                            WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                            IntPtr.Zero,
-                            0,
-                            buffer,
-                            size,
-                            out bytesReturned,
-                            IntPtr.Zero);
-
-                        if (!result)
-                        {
-                            var error = WindowsApi.GetLastError();
-                            _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
-                            return false;
-                        }
-                    }
-                    finally
-                    {
-                        Marshal.FreeHGlobal(buffer);
+                        var error = WindowsApi.GetLastError();
+                        _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
+                        return false;
                     }
                 }
                 finally
                 {
-                    handle.Dispose();
+                    Marshal.FreeHGlobal(buffer);
                 }
 
                 return true;

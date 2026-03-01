@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using Microsoft.Win32.SafeHandles;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -208,7 +209,7 @@ internal static class WindowsApi
     #region API Functions
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Auto)]
-    public static extern IntPtr CreateFile(
+    public static extern SafeFileHandle CreateFile(
         string lpFileName,
         uint dwDesiredAccess,
         uint dwShareMode,
@@ -222,7 +223,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool DeviceIoControl(
-        IntPtr hDevice,
+        SafeFileHandle hDevice,
         uint dwIoControlCode,
         IntPtr lpInBuffer,
         int nInBufferSize,
@@ -233,7 +234,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool DeviceIoControl(
-        IntPtr hDevice,
+        SafeFileHandle hDevice,
         uint dwIoControlCode,
         byte[] lpInBuffer,
         int nInBufferSize,
@@ -244,7 +245,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool ReadFile(
-        IntPtr hFile,
+        SafeFileHandle hFile,
         IntPtr lpBuffer,
         uint nNumberOfBytesToRead,
         out uint lpNumberOfBytesRead,
@@ -252,7 +253,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool ReadFile(
-        IntPtr hFile,
+        SafeFileHandle hFile,
         byte[] lpBuffer,
         uint nNumberOfBytesToRead,
         out uint lpNumberOfBytesRead,
@@ -260,7 +261,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool WriteFile(
-        IntPtr hFile,
+        SafeFileHandle hFile,
         IntPtr lpBuffer,
         uint nNumberOfBytesToWrite,
         out uint lpNumberOfBytesWritten,
@@ -268,7 +269,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool WriteFile(
-        IntPtr hFile,
+        SafeFileHandle hFile,
         byte[] lpBuffer,
         uint nNumberOfBytesToWrite,
         out uint lpNumberOfBytesWritten,
@@ -276,7 +277,7 @@ internal static class WindowsApi
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool SetFilePointerEx(
-        IntPtr hFile,
+        SafeFileHandle hFile,
         long liDistanceToMove,
         out long lpNewFilePointer,
         uint dwMoveMethod);
@@ -286,7 +287,7 @@ internal static class WindowsApi
     public const uint FILE_END = 2;
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern bool FlushFileBuffers(IntPtr hFile);
+    public static extern bool FlushFileBuffers(SafeFileHandle hFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern uint GetLastError();
