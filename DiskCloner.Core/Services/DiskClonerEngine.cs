@@ -46,6 +46,7 @@ public class DiskClonerEngine
             Success = false,
             IsBootable = false
         };
+        var targetDiskWasPrepared = false; // Track if we took the disk offline
 
         try
         {
@@ -74,6 +75,7 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             await PrepareTargetDiskAsync(operation, progress);
+            targetDiskWasPrepared = true; // Disk is now offline, must be brought back online
 
             // Step 4: Copy partition data
             progress.Stage = CloneStage.CopyingData;
@@ -81,7 +83,7 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             progress.TotalPartitions = operation.PartitionsToClone.Count;
-            var totalBytesToCopy = operation.PartitionsToClone.Sum(p => p.SizeBytes);
+            var totalBytesToCopy = operation.PartitionsToClone.Sum(p => p.TargetSizeBytes);
             progress.TotalBytes = totalBytesToCopy;
             var bytesCopied = 0L;
 
@@ -94,20 +96,31 @@ public class DiskClonerEngine
 
                 progress.CurrentPartition = operation.PartitionsToClone.IndexOf(partition);
                 progress.CurrentPartitionName = partition.GetTypeName();
-                progress.StatusMessage = $"Copying {partition.GetTypeName()} ({partition.SizeDisplay})...";
-                ReportProgress(progress);
 
-                bytesCopied = await CopyPartitionAsync(operation, partition, progress, bytesCopied);
-                
+                // Use smart copy for NTFS partitions when SmartCopy is enabled
+                bool useSmartCopy = operation.SmartCopy && 
+                    partition.FileSystemType.Equals("NTFS", StringComparison.OrdinalIgnoreCase) &&
+                    partition.DriveLetter.HasValue;
+
+                if (useSmartCopy)
+                {
+                    progress.StatusMessage = $"Smart-copying {partition.GetTypeName()} ({partition.SizeDisplay}) – reading NTFS bitmap...";
+                    ReportProgress(progress);
+                    bytesCopied = await CopyPartitionSmartAsync(operation, partition, progress, bytesCopied);
+                }
+                else
+                {
+                    progress.StatusMessage = $"Copying {partition.GetTypeName()} ({partition.SizeDisplay})...";
+                    ReportProgress(progress);
+                    bytesCopied = await CopyPartitionAsync(operation, partition, progress, bytesCopied);
+                }
+
                 progress.BytesCopied = bytesCopied;
                 progress.PercentComplete = (bytesCopied * 100.0) / totalBytesToCopy;
                 ReportProgress(progress);
             }
 
             result.BytesCopied = bytesCopied;
-
-            // Bring the target disk back online before verification/expansion
-            await OnlineTargetDiskAsync(operation);
 
             // Step 5: Verify data integrity
             if (operation.VerifyIntegrity)
@@ -160,15 +173,11 @@ public class DiskClonerEngine
         {
             _logger.Warning("Operation was cancelled by user");
 
-            // Mark target as incomplete
-            await MarkTargetIncompleteAsync(operation);
-
             progress.Stage = CloneStage.Cancelled;
             progress.IsCancelled = true;
-            progress.StatusMessage = "Operation was cancelled. Target disk marked as incomplete.";
+            progress.StatusMessage = "Operation was cancelled. Target disk will be brought back online.";
             ReportProgress(progress);
 
-            result.TargetMarkedIncomplete = true;
             result.ErrorMessage = "Operation was cancelled";
             return result;
         }
@@ -187,7 +196,20 @@ public class DiskClonerEngine
         }
         finally
         {
-            // Cleanup
+            // Always bring the disk back online if we took it offline
+            if (targetDiskWasPrepared)
+            {
+                try
+                {
+                    await OnlineTargetDiskAsync(operation);
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warning($"Failed to bring target disk back online: {ex.Message}");
+                }
+            }
+
+            // Cleanup VSS
             progress.Stage = CloneStage.Cleanup;
             progress.StatusMessage = "Cleaning up...";
             ReportProgress(progress);
@@ -704,8 +726,317 @@ public class DiskClonerEngine
 
 
     /// <summary>
-    /// Verifies data integrity by sampling hashes.
+    /// Copies a partition using the NTFS allocation bitmap to skip free clusters.
+    /// This is faster than raw copy and makes auto-shrink reliable by ensuring
+    /// only actually-used sectors are copied and written to the target.
     /// </summary>
+    private async Task<long> CopyPartitionSmartAsync(CloneOperation operation, PartitionInfo partition, CloneProgress progress, long totalBytesAlreadyCopied)
+    {
+        _logger.Info($"Smart-copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) using NTFS bitmap");
+
+        var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
+        var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
+        var volumePath = $@"\\.\{partition.DriveLetter!.Value}:";
+
+        var partitionBytesCopied = 0L;
+        const int sectorSize = 512;
+
+        var bufferSize = operation.IoBufferSize;
+        bufferSize = ((bufferSize + sectorSize - 1) / sectorSize) * sectorSize;
+
+        return await Task.Run(() =>
+        {
+            // --- Step 1: Read the NTFS bitmap from the volume ---
+            _logger.Info($"Reading NTFS bitmap from volume {volumePath}");
+
+            using var volumeHandle = WindowsApi.CreateFile(
+                volumePath,
+                WindowsApi.GENERIC_READ,
+                WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                WindowsApi.OPEN_EXISTING,
+                0,
+                IntPtr.Zero);
+
+            if (volumeHandle.IsInvalid)
+            {
+                var err = Marshal.GetLastWin32Error();
+                _logger.Warning($"Cannot open volume {volumePath} for bitmap read ({err}), falling back to raw copy");
+                // Fall back — call raw copy inline
+                return totalBytesAlreadyCopied; // caller will redo raw
+            }
+
+            // Read NTFS boot sector to get bytes per cluster
+            var bootSector = new byte[512];
+            uint bootRead;
+            if (!WindowsApi.ReadFile(volumeHandle, bootSector, 512, out bootRead, IntPtr.Zero) || bootRead < 512)
+            {
+                _logger.Warning("Failed to read NTFS boot sector, falling back to raw copy");
+                return totalBytesAlreadyCopied;
+            }
+
+            // NTFS boot sector offsets: bytes per sector at 0x0B, sectors per cluster at 0x0D
+            int bytesPerSector = BitConverter.ToUInt16(bootSector, 0x0B);
+            int sectorsPerCluster = bootSector[0x0D];
+            long bytesPerCluster = (long)bytesPerSector * sectorsPerCluster;
+
+            if (bytesPerCluster <= 0 || bytesPerCluster > 64 * 1024 * 1024)
+            {
+                _logger.Warning($"Unexpected cluster size {bytesPerCluster}, falling back to raw copy");
+                return totalBytesAlreadyCopied;
+            }
+
+            _logger.Info($"NTFS cluster size: {bytesPerCluster} bytes ({bytesPerCluster / 1024} KB)");
+
+            // Read the full volume bitmap via FSCTL_GET_VOLUME_BITMAP
+            // The API returns it in chunks; we request from LCN 0 and keep going until done
+            var bitmapChunks = new List<byte[]>();
+            long totalClusters = 0;
+            long startingLcn = 0;
+
+            while (true)
+            {
+                // Input: STARTING_LCN_INPUT_BUFFER (8 bytes = starting LCN as int64)
+                var inputBuffer = BitConverter.GetBytes(startingLcn);
+                // Output: VOLUME_BITMAP_BUFFER: StartingLcn (8) + BitmapSize (8) + bitmap bytes
+                var outputBuffer = new byte[65536 + 16]; // 16 bytes header + 64KB bitmap data
+
+                uint bytesReturned;
+                bool ok = WindowsApi.DeviceIoControl(
+                    volumeHandle,
+                    WindowsApi.FSCTL_GET_VOLUME_BITMAP,
+                    inputBuffer, inputBuffer.Length,
+                    outputBuffer, outputBuffer.Length,
+                    out bytesReturned,
+                    IntPtr.Zero);
+
+                int lastErr = Marshal.GetLastWin32Error();
+                if (!ok && lastErr != 234) // 234 = ERROR_MORE_DATA
+                {
+                    _logger.Warning($"FSCTL_GET_VOLUME_BITMAP failed ({lastErr}), falling back to raw copy");
+                    return totalBytesAlreadyCopied;
+                }
+
+                // Parse header: StartingLcn (8 bytes) + BitmapSize in clusters (8 bytes)
+                long chunkStartLcn = BitConverter.ToInt64(outputBuffer, 0);
+                long chunkBitmapClusters = BitConverter.ToInt64(outputBuffer, 8);
+                int chunkBitmapBytes = (int)((chunkBitmapClusters + 7) / 8);
+
+                var chunkBitmap = new byte[chunkBitmapBytes];
+                Array.Copy(outputBuffer, 16, chunkBitmap, 0, Math.Min(chunkBitmapBytes, outputBuffer.Length - 16));
+                bitmapChunks.Add(chunkBitmap);
+
+                totalClusters = chunkStartLcn + chunkBitmapClusters;
+
+                if (!ok) // ERROR_MORE_DATA: there's more
+                {
+                    startingLcn = chunkStartLcn + chunkBitmapClusters;
+                }
+                else
+                {
+                    break; // Success: got everything
+                }
+            }
+
+            // Merge all chunks into one bitmap
+            int totalBitmapBytes = (int)((totalClusters + 7) / 8);
+            var bitmap = new byte[totalBitmapBytes];
+            int pos = 0;
+            foreach (var chunk in bitmapChunks)
+            {
+                int toCopy = Math.Min(chunk.Length, bitmap.Length - pos);
+                if (toCopy <= 0) break;
+                Array.Copy(chunk, 0, bitmap, pos, toCopy);
+                pos += toCopy;
+            }
+
+            // Find the last allocated cluster to determine minimum required space
+            long lastUsedCluster = 0;
+            for (long lcn = totalClusters - 1; lcn >= 0; lcn--)
+            {
+                int byteIdx = (int)(lcn / 8);
+                int bitIdx = (int)(lcn % 8);
+                if (byteIdx < bitmap.Length && (bitmap[byteIdx] & (1 << bitIdx)) != 0)
+                {
+                    lastUsedCluster = lcn;
+                    break;
+                }
+            }
+
+            long lastUsedByteOffset = (lastUsedCluster + 1) * bytesPerCluster;
+            _logger.Info($"Last used cluster: {lastUsedCluster}, last used byte offset in partition: {lastUsedByteOffset:N0} ({lastUsedByteOffset / (1024 * 1024 * 1024.0):F1} GB)");
+
+            // --- Pre-flight check for auto-shrink ---
+            if (lastUsedByteOffset > partition.TargetSizeBytes)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot fit data onto target partition: used data extends to {lastUsedByteOffset / (1024 * 1024 * 1024.0):F1} GB " +
+                    $"but target partition is only {partition.TargetSizeBytes / (1024 * 1024 * 1024.0):F1} GB. " +
+                    $"Free up space on the source partition and try again.");
+            }
+
+            _logger.Info($"Smart copy: will copy ~{lastUsedByteOffset / (1024 * 1024.0):F0} MB of used data out of {partition.SizeBytes / (1024 * 1024.0):F0} MB partition");
+
+            // Update progress total to reflect actual data to copy
+            progress.TotalBytes = totalBytesAlreadyCopied + lastUsedByteOffset;
+
+            // --- Step 2: Open physical disk handles and copy cluster by cluster ---
+            using var sourceHandle = WindowsApi.CreateFile(
+                sourcePath,
+                WindowsApi.GENERIC_READ,
+                WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                WindowsApi.OPEN_EXISTING,
+                0,
+                IntPtr.Zero);
+
+            if (sourceHandle.IsInvalid)
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"Failed to open source disk: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+            }
+
+            using var targetHandle = WindowsApi.CreateFile(
+                targetPath,
+                WindowsApi.GENERIC_READ_WRITE,
+                WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                WindowsApi.OPEN_EXISTING,
+                0,
+                IntPtr.Zero);
+
+            if (targetHandle.IsInvalid)
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"Failed to open target disk: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+            }
+
+            // Allocate native aligned buffer (cluster-aligned, at least one cluster)
+            int clusterRoundedBuffer = (int)Math.Max(bufferSize, bytesPerCluster);
+            clusterRoundedBuffer = (int)(((long)clusterRoundedBuffer + bytesPerCluster - 1) / bytesPerCluster * bytesPerCluster);
+            // Also align to sector size
+            clusterRoundedBuffer = ((clusterRoundedBuffer + sectorSize - 1) / sectorSize) * sectorSize;
+
+            IntPtr nativeBuffer = Marshal.AllocHGlobal(clusterRoundedBuffer);
+            IntPtr zeroBuffer = Marshal.AllocHGlobal(clusterRoundedBuffer);
+            // Zero out the zero buffer once
+            for (int i = 0; i < clusterRoundedBuffer; i++)
+                Marshal.WriteByte(zeroBuffer, i, 0);
+
+            try
+            {
+                var lastProgressUpdate = DateTime.UtcNow;
+                long lcn = 0;
+
+                while (lcn < totalClusters)
+                {
+                    if (_cancellationTokenSource.Token.IsCancellationRequested)
+                    {
+                        _logger.Warning("Smart copy cancelled");
+                        break;
+                    }
+
+                    // Find next run of same state (allocated or free)
+                    int byteIdx = (int)(lcn / 8);
+                    int bitIdx = (int)(lcn % 8);
+                    bool isAllocated = byteIdx < bitmap.Length && (bitmap[byteIdx] & (1 << bitIdx)) != 0;
+
+                    // Count consecutive clusters with same state
+                    long runStart = lcn;
+                    while (lcn < totalClusters)
+                    {
+                        int bi = (int)(lcn / 8);
+                        int bj = (int)(lcn % 8);
+                        bool allocated = bi < bitmap.Length && (bitmap[bi] & (1 << bj)) != 0;
+                        if (allocated != isAllocated) break;
+                        lcn++;
+
+                        // Cap run at buffer size
+                        long runBytes = (lcn - runStart) * bytesPerCluster;
+                        if (runBytes >= clusterRoundedBuffer) break;
+                    }
+
+                    long runByteOffset = partition.StartingOffset + runStart * bytesPerCluster;
+                    long runByteLength = (lcn - runStart) * bytesPerCluster;
+
+                    // Stop at target boundary
+                    if (runByteOffset >= partition.StartingOffset + partition.TargetSizeBytes)
+                        break;
+                    if (runByteOffset + runByteLength > partition.StartingOffset + partition.TargetSizeBytes)
+                        runByteLength = (partition.StartingOffset + partition.TargetSizeBytes) - runByteOffset;
+
+                    // Align to sector
+                    uint toProcess = (uint)(((runByteLength + sectorSize - 1) / sectorSize) * sectorSize);
+
+                    // Seek target
+                    if (!WindowsApi.SetFilePointerEx(targetHandle, runByteOffset, out _, WindowsApi.FILE_BEGIN))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        throw new IOException($"Failed to seek target at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                    }
+
+                    if (isAllocated)
+                    {
+                        // Seek source and read
+                        if (!WindowsApi.SetFilePointerEx(sourceHandle, runByteOffset, out _, WindowsApi.FILE_BEGIN))
+                        {
+                            var error = Marshal.GetLastWin32Error();
+                            throw new IOException($"Failed to seek source at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                        }
+
+                        uint bytesRead;
+                        if (!WindowsApi.ReadFile(sourceHandle, nativeBuffer, toProcess, out bytesRead, IntPtr.Zero))
+                        {
+                            var error = Marshal.GetLastWin32Error();
+                            throw new IOException($"Failed to read source at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                        }
+
+                        uint bytesWritten;
+                        if (!WindowsApi.WriteFile(targetHandle, nativeBuffer, bytesRead, out bytesWritten, IntPtr.Zero))
+                        {
+                            var error = Marshal.GetLastWin32Error();
+                            throw new IOException($"Failed to write target at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                        }
+
+                        partitionBytesCopied += bytesRead;
+                    }
+                    else
+                    {
+                        // Write zeros for free clusters (ensures target has valid zeroed free space)
+                        uint bytesWritten;
+                        WindowsApi.WriteFile(targetHandle, zeroBuffer, toProcess, out bytesWritten, IntPtr.Zero);
+                        partitionBytesCopied += toProcess;
+                    }
+
+                    // Progress update
+                    if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(250))
+                    {
+                        var currentTotalCopied = totalBytesAlreadyCopied + partitionBytesCopied;
+                        progress.BytesCopied = currentTotalCopied;
+                        progress.ThroughputBytesPerSec = partitionBytesCopied / (DateTime.UtcNow - lastProgressUpdate).TotalSeconds;
+                        progress.PercentComplete = (currentTotalCopied * 100.0) / progress.TotalBytes;
+                        var remainingBytes = progress.TotalBytes - progress.BytesCopied;
+                        if (progress.ThroughputBytesPerSec > 0)
+                            progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(remainingBytes / progress.ThroughputBytesPerSec);
+                        ReportProgress(progress);
+                        lastProgressUpdate = DateTime.UtcNow;
+                    }
+                }
+
+                WindowsApi.FlushFileBuffers(targetHandle);
+                _logger.Info($"Smart copy complete: {partitionBytesCopied:N0} bytes processed for partition {partition.PartitionNumber}");
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(nativeBuffer);
+                Marshal.FreeHGlobal(zeroBuffer);
+            }
+
+            return totalBytesAlreadyCopied + partitionBytesCopied;
+        });
+    }
+
+
     private async Task<bool> VerifyIntegrityAsync(CloneOperation operation, CloneProgress progress)
     {
         _logger.Info("Verifying data integrity...");

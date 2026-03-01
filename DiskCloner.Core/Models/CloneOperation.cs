@@ -51,6 +51,13 @@ public class CloneOperation
     public bool AllowSmallerTarget { get; set; } = false;
 
     /// <summary>
+    /// Whether to use smart (bitmap-guided) copy that skips unallocated sectors.
+    /// Faster than raw copy and required for reliable auto-shrink to smaller targets.
+    /// Only applies to NTFS partitions; other partition types always use raw copy.
+    /// </summary>
+    public bool SmartCopy { get; set; } = false;
+
+    /// <summary>
     /// Path to the log file.
     /// </summary>
     public string LogFilePath { get; set; } = string.Empty;
