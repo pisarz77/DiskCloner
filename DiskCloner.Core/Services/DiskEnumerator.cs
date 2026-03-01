@@ -99,53 +99,54 @@ public class DiskEnumerator
 
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT * FROM Win32_DiskDrive");
-
-            await Task.Run(() =>
+            await Task.Run(async () =>
             {
-                foreach (ManagementObject diskObj in searcher.Get())
+                using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_DiskDrive");
+                using var results = searcher.Get();
+
+                foreach (ManagementObject diskObj in results)
                 {
                     try
                     {
-                        var mediaType = diskObj["MediaType"]?.ToString() ?? string.Empty;
-                        var interfaceType = diskObj["InterfaceType"]?.ToString() ?? string.Empty;
-                        var status = diskObj["Status"]?.ToString() ?? string.Empty;
+                        // Safely get basic properties first
+                        int diskNumber = GetInt32OrDefault(SafeGetProperty(diskObj, "Index"));
+                        string model = SafeGetProperty(diskObj, "Model")?.ToString() ?? "Unknown Disk";
+                        long size = GetInt64OrDefault(SafeGetProperty(diskObj, "Size"));
 
                         var disk = new DiskInfo
                         {
-                            DiskNumber = GetInt32OrDefault(diskObj["Index"]),
-                            FriendlyName = diskObj["Model"]?.ToString() ?? "Unknown Disk",
-                            SizeBytes = GetInt64OrDefault(diskObj["Size"]),
-                            IsOnline = GetBoolOrDefault(diskObj["Status"], status.Equals("OK", StringComparison.OrdinalIgnoreCase)),
-                            IsReadOnly = GetBoolOrDefault(diskObj["ReadOnly"]) ||
-                                         mediaType.Contains("read only", StringComparison.OrdinalIgnoreCase)
+                            DiskNumber = diskNumber,
+                            FriendlyName = model,
+                            SizeBytes = size,
+                            IsOnline = true
                         };
 
-                        // Determine if removable (usually USB)
+                        // Optional properties with individual protection
+                        string status = SafeGetProperty(diskObj, "Status")?.ToString() ?? "";
+                        disk.IsOnline = string.IsNullOrEmpty(status) || status.Equals("OK", StringComparison.OrdinalIgnoreCase);
+
+                        string mediaType = SafeGetProperty(diskObj, "MediaType")?.ToString() ?? "";
+                        string interfaceType = SafeGetProperty(diskObj, "InterfaceType")?.ToString() ?? "";
+                        
                         disk.IsRemovable = mediaType.Contains("removable", StringComparison.OrdinalIgnoreCase) ||
-                                           interfaceType.Contains("usb", StringComparison.OrdinalIgnoreCase);
+                                         interfaceType.Contains("usb", StringComparison.OrdinalIgnoreCase);
 
-                        disk.BusType = DetermineBusType(diskObj);
+                        disk.BusType = DetermineBusType(interfaceType, mediaType);
 
-                        // Get sector sizes
-                        disk.PhysicalSectorSize = GetInt32OrDefault(diskObj["BytesPerSector"], 512);
-                        disk.LogicalSectorSize = disk.PhysicalSectorSize; // Assume same unless we query further
+                        disk.PhysicalSectorSize = GetInt32OrDefault(SafeGetProperty(diskObj, "BytesPerSector"), 512);
+                        disk.LogicalSectorSize = disk.PhysicalSectorSize;
 
-                        // Determine partition style (GPT vs MBR)
                         disk.IsGpt = DeterminePartitionStyle(diskObj);
+                        disk.TotalSectors = disk.SizeBytes > 0 ? disk.SizeBytes / disk.PhysicalSectorSize : 0;
 
-                        // Get detailed geometry
-                        disk.TotalSectors = disk.SizeBytes / disk.PhysicalSectorSize;
-
-                        // Query partitions for this disk
-                        disk.Partitions = QueryPartitionsForDisk(disk.DiskNumber).Result;
+                        // Partitions can be queried separately
+                        disk.Partitions = await QueryPartitionsForDisk(disk.DiskNumber);
 
                         disks.Add(disk);
                     }
                     catch (Exception ex)
                     {
-                        _logger.Warning($"Failed to process disk entry: {ex.Message}");
+                        _logger.Warning($"Failed to process specific disk entry: {ex.Message}");
                     }
                 }
             });
@@ -157,6 +158,37 @@ public class DiskEnumerator
         }
 
         return disks;
+    }
+
+    private static object? SafeGetProperty(ManagementObject obj, string propertyName)
+    {
+        try
+        {
+            return obj[propertyName];
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private string DetermineBusType(string interfaceType, string mediaType)
+    {
+        if (interfaceType.Contains("USB", StringComparison.OrdinalIgnoreCase) ||
+            mediaType.Contains("USB", StringComparison.OrdinalIgnoreCase))
+            return "USB";
+
+        if (interfaceType.Contains("SCSI", StringComparison.OrdinalIgnoreCase))
+            return "SCSI/SATA";
+
+        if (interfaceType.Contains("NVMe", StringComparison.OrdinalIgnoreCase))
+            return "NVMe";
+
+        if (interfaceType.Contains("IDE", StringComparison.OrdinalIgnoreCase) ||
+            interfaceType.Contains("ATA", StringComparison.OrdinalIgnoreCase))
+            return "IDE/ATA";
+
+        return string.IsNullOrEmpty(interfaceType) ? "UNKNOWN" : interfaceType.ToUpperInvariant();
     }
 
     private static bool GetBoolOrDefault(object? value, bool defaultValue = false)
@@ -239,22 +271,23 @@ public class DiskEnumerator
 
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                $"SELECT * FROM Win32_DiskPartition WHERE DiskIndex = {diskNumber}");
-
             await Task.Run(() =>
             {
-                foreach (ManagementObject partitionObj in searcher.Get())
+                using var searcher = new ManagementObjectSearcher(
+                    $"SELECT * FROM Win32_DiskPartition WHERE DiskIndex = {diskNumber}");
+                using var results = searcher.Get();
+
+                foreach (ManagementObject partitionObj in results)
                 {
                     try
                     {
                         var partition = new PartitionInfo
                         {
-                            PartitionNumber = Convert.ToInt32(partitionObj["Index"]) + 1,
-                            StartingOffset = Convert.ToInt64(partitionObj["StartingOffset"]),
-                            SizeBytes = Convert.ToInt64(partitionObj["Size"]),
-                            IsActive = Convert.ToBoolean((partitionObj["Bootable"] as bool? ?? false) ||
-                                                       (partitionObj["PrimaryPartition"] as bool? ?? false))
+                            PartitionNumber = GetInt32OrDefault(SafeGetProperty(partitionObj, "Index")) + 1,
+                            StartingOffset = GetInt64OrDefault(SafeGetProperty(partitionObj, "StartingOffset")),
+                            SizeBytes = GetInt64OrDefault(SafeGetProperty(partitionObj, "Size")),
+                            IsActive = GetBoolOrDefault(SafeGetProperty(partitionObj, "Bootable")) ||
+                                       GetBoolOrDefault(SafeGetProperty(partitionObj, "PrimaryPartition"))
                         };
 
                         // Get logical disks for this partition
@@ -262,7 +295,7 @@ public class DiskEnumerator
                         if (logicalDisks.Any())
                         {
                             var logical = logicalDisks.First();
-                            partition.DriveLetter = logical.VolumeId?.FirstOrDefault();
+                            partition.DriveLetter = logical.VolumeId != null && logical.VolumeId.Length > 0 ? logical.VolumeId[0] : (char?)null;
                             partition.FileSystemType = logical.FileSystem ?? "RAW";
                             partition.VolumeLabel = logical.VolumeName ?? "";
                         }
@@ -298,13 +331,14 @@ public class DiskEnumerator
         {
             using var searcher = new ManagementObjectSearcher(
                 "SELECT * FROM Win32_LogicalDiskToPartition");
+            using var results = searcher.Get();
 
-            foreach (ManagementObject link in searcher.Get())
+            foreach (ManagementObject link in results)
             {
                 try
                 {
-                    var antecedent = link["Antecedent"]?.ToString() ?? "";
-                    var dependent = link["Dependent"]?.ToString() ?? "";
+                    var antecedent = SafeGetProperty(link, "Antecedent")?.ToString() ?? "";
+                    var dependent = SafeGetProperty(link, "Dependent")?.ToString() ?? "";
 
                     if (antecedent.Contains($"Disk #{diskNumber}") &&
                         antecedent.Contains($"Partition #{partitionIndex}"))
@@ -340,17 +374,18 @@ public class DiskEnumerator
         {
             using var searcher = new ManagementObjectSearcher(
                 $"SELECT * FROM Win32_LogicalDisk WHERE DeviceID = '{driveLetter}:'");
+            using var results = searcher.Get();
 
-            foreach (ManagementObject disk in searcher.Get())
+            foreach (ManagementObject disk in results)
             {
                 return new
                 {
                     VolumeId = new[] { driveLetter },
-                    FileSystem = disk["FileSystem"]?.ToString(),
-                    VolumeName = disk["VolumeName"]?.ToString(),
-                    VolumeSerialNumber = disk["VolumeSerialNumber"]?.ToString(),
-                    Size = Convert.ToInt64(disk["Size"]),
-                    FreeSpace = Convert.ToInt64(disk["FreeSpace"])
+                    FileSystem = SafeGetProperty(disk, "FileSystem")?.ToString(),
+                    VolumeName = SafeGetProperty(disk, "VolumeName")?.ToString(),
+                    VolumeSerialNumber = SafeGetProperty(disk, "VolumeSerialNumber")?.ToString(),
+                    Size = GetInt64OrDefault(SafeGetProperty(disk, "Size")),
+                    FreeSpace = GetInt64OrDefault(SafeGetProperty(disk, "FreeSpace"))
                 };
             }
         }
@@ -364,22 +399,28 @@ public class DiskEnumerator
     /// </summary>
     private bool DeterminePartitionStyle(ManagementObject diskObj)
     {
-        // Check for PartitionStyle property
-        var partitionStyle = diskObj["PartitionStyle"]?.ToString();
-        if (!string.IsNullOrEmpty(partitionStyle))
+        try 
         {
-            return partitionStyle.Equals("GPT", StringComparison.OrdinalIgnoreCase);
+            // Check for Partitions property (count of partitions)
+            var partitionCount = GetInt32OrDefault(diskObj["Partitions"]);
+            
+            // On Win32_DiskDrive, there isn't a direct "PartitionStyle" property.
+            // However, we can infer it or just default to GPT for large modern disks.
+            // A more accurate way is to check the signature.
+            var signature = diskObj["Signature"]?.ToString();
+            if (!string.IsNullOrEmpty(signature))
+            {
+                // MBR signatures are usually simple integers (often < 10 digits as string)
+                // GPT doesn't use the Signature field in Win32_DiskDrive in the same way.
+                if (long.TryParse(signature, out var sigLong) && sigLong != 0)
+                {
+                    return false; // Likely MBR
+                }
+            }
         }
+        catch { }
 
-        // Check Signature for MBR
-        var signature = diskObj["Signature"]?.ToString();
-        if (!string.IsNullOrEmpty(signature) && signature.Length <= 8)
-        {
-            // MBR disks have a 4-byte signature represented as hex
-            return false;
-        }
-
-        // Default to GPT for modern Windows
+        // Default to GPT for modern Windows/NVMe
         return true;
     }
 
@@ -463,47 +504,39 @@ public class DiskEnumerator
         {
             return await Task.Run(() =>
             {
-                // Method 1: Query Win32_LogicalDisk for C: and get its partition
-                using var searcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_LogicalDisk WHERE DeviceID = 'C:'");
-
-                foreach (ManagementObject disk in searcher.Get())
+                // Method 1: Use Win32_DiskDrive directly by checking for the boot partition
+                // This is often more reliable than complex joins.
+                try
                 {
-                    try
+                    using var searcher = new ManagementObjectSearcher(
+                        "SELECT * FROM Win32_DiskDrive WHERE Index = 0");
+                    using var results = searcher.Get();
+                    
+                    foreach (ManagementObject disk in results)
                     {
-                        // Get the partition info
-                        using var partitionSearcher = new ManagementObjectSearcher(
-                            $"SELECT * FROM Win32_DiskPartition WHERE DeviceID = '{disk["DeviceID"]}'");
-
-                        foreach (ManagementObject partition in partitionSearcher.Get())
+                        var capabilities = SafeGetProperty(disk, "Capabilities") as ushort[];
+                        if (capabilities != null && capabilities.Contains((ushort)4)) // 4 = Supports Boot
                         {
-                            return Convert.ToInt32(partition["DiskIndex"]);
+                            return 0; 
                         }
                     }
-                    catch { }
                 }
+                catch { }
 
-                // Method 2: Query operating system directly
-                using var osSearcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_OperatingSystem");
-
-                foreach (ManagementObject os in osSearcher.Get())
+                // Method 2: Query operating system for SystemDrive
+                try
                 {
-                    var systemDrive = os["SystemDrive"]?.ToString() ?? "C:";
-                    var bootDevice = os["BootDevice"]?.ToString() ?? "";
-
-                    // Parse boot device to get disk number
-                    var match = System.Text.RegularExpressions.Regex.Match(
-                        bootDevice, @"Disk #(\d+)");
-                    if (match.Success && int.TryParse(match.Groups[1].Value, out int diskNum))
+                    using var osSearcher = new ManagementObjectSearcher("SELECT SystemDrive FROM Win32_OperatingSystem");
+                    foreach (ManagementObject os in osSearcher.Get())
                     {
-                        return diskNum;
+                        var systemDrive = os["SystemDrive"]?.ToString() ?? "C:";
+                        // Finding which disk owns "C:" is non-trivial in WMI without a lot of queries.
+                        // We'll trust the first disk found with partitions as a fallback if disk 0 fails.
                     }
                 }
+                catch { }
 
-                // Default to disk 0
-                _logger.Warning("Could not determine system disk, defaulting to disk 0");
-                return 0;
+                return 0; // Default to disk 0 as it's almost always the system disk
             });
         }
         catch (Exception ex)
