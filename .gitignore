@@ -1,0 +1,38 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+out/
+publish/
+
+# User- and machine-specific files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE folders
+.vs/
+.vscode/
+.idea/
+
+# Test and coverage artifacts
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# Logs and diagnostics
+*.log
+*.pid
+*.tmp
+*.cache
+
+# OS files
+.DS_Store
+Thumbs.db
