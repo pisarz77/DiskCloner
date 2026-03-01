@@ -286,6 +286,10 @@ public partial class MainWindow : Window
         // Instead of disabling the whole TabControl (which kills scrollbars), 
         // we disable specific interactive elements.
         SetInteractiveElementsEnabled(false);
+
+        // Always reset Cancel button at start of every clone
+        CancelButton.IsEnabled = true;
+        CancelButton.Content = "Cancel";
         
         // Scroll progress into view
         ProgressBorder.BringIntoView();
@@ -311,6 +315,9 @@ public partial class MainWindow : Window
             _isCloning = false;
             _clonerEngine.ProgressUpdate -= OnProgressUpdate;
             SetInteractiveElementsEnabled(true);
+            // Always restore Cancel button when done
+            CancelButton.IsEnabled = false;
+            CancelButton.Content = "Cancel";
         }
 
         // Show results

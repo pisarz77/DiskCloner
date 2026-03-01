@@ -448,10 +448,8 @@ public class DiskClonerEngine
 
         scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
         scriptContent.AppendLine("clean");
-        scriptContent.AppendLine("attributes disk set readonly=no"); // Ensure writable
-        scriptContent.AppendLine("offline disk"); // Offline to prevent interference
-        scriptContent.AppendLine("online disk");  // Online to partition
-        scriptContent.AppendLine("convert gpt noerr");
+        scriptContent.AppendLine("online disk noerr");
+        scriptContent.AppendLine("attributes disk clear readonly noerr");
 
         if (operation.SourceDisk.IsGpt)
         {
@@ -463,9 +461,6 @@ public class DiskClonerEngine
         }
 
         // Create partitions matching the source
-        var alignment = 1024L * 1024; // 1MB alignment
-        var currentOffset = 1024L * 1024; // Start at 1MB
-
         foreach (var partition in operation.PartitionsToClone.OrderBy(p => p.StartingOffset))
         {
             var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
@@ -478,14 +473,15 @@ public class DiskClonerEngine
             {
                 scriptContent.AppendLine($"create partition msr size={sizeMB}");
             }
+            else if (partition.IsRecoveryPartition)
+            {
+                scriptContent.AppendLine($"create partition primary size={sizeMB}");
+                scriptContent.AppendLine("set id=de94bba4-06d1-4d40-a16a-bfd50179d6ac override");
+                scriptContent.AppendLine("gpt attributes=0x8000000000000001"); // Required + No Drive Letter
+            }
             else
             {
                 scriptContent.AppendLine($"create partition primary size={sizeMB}");
-                if (partition.IsSystemPartition)
-                {
-                    scriptContent.AppendLine("set id=\"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7\""); // Basic Data
-                }
-                scriptContent.AppendLine("gpt attributes=0x8000000000000000"); // No Default Drive Letter
             }
         }
 
@@ -517,13 +513,14 @@ public class DiskClonerEngine
             {
                 var output = await process.StandardOutput.ReadToEndAsync();
                 var error = await process.StandardError.ReadToEndAsync();
-                process.WaitForExit();
+                await process.WaitForExitAsync();
+
+                _logger.Info($"DiskPart output: {output}");
 
                 if (process.ExitCode != 0)
                 {
-                    _logger.Error($"diskpart failed with code {process.ExitCode}. Output: {output} Error: {error}");
-                    _logger.Error("Failed DiskPart Script content:");
-                    _logger.Error(scriptContent.ToString());
+                    _logger.Error($"diskpart failed with code {process.ExitCode}. Error: {error}");
+                    _logger.Error($"DiskPart script was:\n{scriptContent}");
                     throw new IOException($"Failed to create partitions: DiskPart error {process.ExitCode}. See logs for details.");
                 }
                 else
@@ -543,7 +540,9 @@ public class DiskClonerEngine
     }
 
     /// <summary>
-    /// Copies a single partition from source to target.
+    /// Copies a single partition from source to target using native aligned buffers.
+    /// Physical disk handles on Windows implicitly use unbuffered I/O, which requires
+    /// sector-aligned buffer memory, offsets, and byte counts.
     /// </summary>
     private async Task<long> CopyPartitionAsync(CloneOperation operation, PartitionInfo partition, CloneProgress progress, long totalBytesAlreadyCopied)
     {
@@ -553,8 +552,12 @@ public class DiskClonerEngine
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
 
         var partitionBytesCopied = 0L;
-        var totalBytesInPartition = partition.TargetSizeBytes; // Truncate if Target is smaller
+        var totalBytesInPartition = partition.TargetSizeBytes;
+        const int sectorSize = 512;
+
+        // Align buffer size to sector boundary
         var bufferSize = operation.IoBufferSize;
+        bufferSize = ((bufferSize + sectorSize - 1) / sectorSize) * sectorSize;
 
         await Task.Run(() =>
         {
@@ -568,7 +571,10 @@ public class DiskClonerEngine
                 IntPtr.Zero);
 
             if (sourceHandle.IsInvalid)
-                throw new IOException($"Failed to open source disk: {WindowsApi.GetLastErrorMessage()}");
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"Failed to open source disk: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+            }
 
             // Open target with READ+WRITE (both needed for raw physical disk I/O)
             // The disk should be OFFLINE at this point (set by diskpart), so no mounted volumes block us.
@@ -589,83 +595,113 @@ public class DiskClonerEngine
 
             _logger.Info($"Target disk handle opened successfully for partition {partition.PartitionNumber}");
 
-            // Align buffer to sector size
-            bufferSize = ((bufferSize + 511) / 512) * 512;
+            // Allocate native memory for sector-aligned I/O buffer.
+            // Physical disk handles require sector-aligned buffers, offsets, and byte counts.
+            // Marshal.AllocHGlobal returns page-aligned memory on Windows, satisfying this requirement.
+            IntPtr nativeBuffer = Marshal.AllocHGlobal(bufferSize);
 
-            var buffer = new byte[bufferSize];
-            var offset = partition.StartingOffset;
-            var lastProgressUpdate = DateTime.UtcNow;
-
-            while (partitionBytesCopied < totalBytesInPartition)
+            try
             {
-                if (_cancellationTokenSource.Token.IsCancellationRequested)
+                var offset = partition.StartingOffset;
+                var lastProgressUpdate = DateTime.UtcNow;
+
+                // Ensure starting offset is sector-aligned
+                if (offset % sectorSize != 0)
                 {
-                    _logger.Warning("Copy operation cancelled");
-                    break;
+                    _logger.Warning($"Partition starting offset {offset} is not sector-aligned, rounding down");
+                    offset = (offset / sectorSize) * sectorSize;
                 }
 
-                var bytesToRead = (int)Math.Min(bufferSize, totalBytesInPartition - partitionBytesCopied);
-
-                // Seek to source position
-                if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                while (partitionBytesCopied < totalBytesInPartition)
                 {
-                    var error = Marshal.GetLastWin32Error();
-                    throw new IOException($"Failed to seek source: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
-                }
-
-                // Seek to target position
-                if (!WindowsApi.SetFilePointerEx(targetHandle, offset, out _, WindowsApi.FILE_BEGIN))
-                {
-                    var error = Marshal.GetLastWin32Error();
-                    throw new IOException($"Failed to seek target: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
-                }
-
-                // Read from source
-                uint bytesRead;
-                if (!WindowsApi.ReadFile(sourceHandle, buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
-                {
-                    var error = Marshal.GetLastWin32Error();
-                    throw new IOException($"Failed to read from source: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
-                }
-
-                // Write to target
-                uint bytesWritten;
-                if (!WindowsApi.WriteFile(targetHandle, buffer, bytesRead, out bytesWritten, IntPtr.Zero))
-                {
-                    var error = Marshal.GetLastWin32Error();
-                    throw new IOException($"Failed to write to target: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
-                }
-
-                partitionBytesCopied += bytesRead;
-                offset += bytesRead;
-
-                // Update progress periodically
-                if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(250)) // More frequent updates
-                {
-                    var currentTotalCopied = totalBytesAlreadyCopied + partitionBytesCopied;
-                    progress.BytesCopied = currentTotalCopied;
-                    progress.ThroughputBytesPerSec = bytesRead / (DateTime.UtcNow - lastProgressUpdate).TotalSeconds;
-                    progress.PercentComplete = (currentTotalCopied * 100.0) / progress.TotalBytes;
-
-                    var remainingBytes = progress.TotalBytes - progress.BytesCopied;
-                    if (progress.ThroughputBytesPerSec > 0)
+                    if (_cancellationTokenSource.Token.IsCancellationRequested)
                     {
-                        progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(remainingBytes / progress.ThroughputBytesPerSec);
+                        _logger.Warning("Copy operation cancelled");
+                        break;
                     }
 
-                    ReportProgress(progress);
-                    lastProgressUpdate = DateTime.UtcNow;
-                }
-            }
+                    // Calculate bytes to read, rounded UP to sector boundary
+                    var bytesRemaining = totalBytesInPartition - partitionBytesCopied;
+                    var bytesToRead = (int)Math.Min(bufferSize, bytesRemaining);
+                    // Round up to sector size for physical disk I/O
+                    bytesToRead = ((bytesToRead + sectorSize - 1) / sectorSize) * sectorSize;
 
-            // Flush target buffers
-            WindowsApi.FlushFileBuffers(targetHandle);
+                    // Seek to source position
+                    if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        throw new IOException($"Failed to seek source at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                    }
+
+                    // Read from source using native buffer
+                    uint bytesRead;
+                    if (!WindowsApi.ReadFile(sourceHandle, nativeBuffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        throw new IOException($"Failed to read from source at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                    }
+
+                    if (bytesRead == 0)
+                    {
+                        _logger.Warning($"Read 0 bytes at offset {offset}, stopping partition copy");
+                        break;
+                    }
+
+                    // Ensure write size is sector-aligned
+                    uint bytesToWrite = ((bytesRead + (uint)sectorSize - 1) / (uint)sectorSize) * (uint)sectorSize;
+
+                    // Seek to target position
+                    if (!WindowsApi.SetFilePointerEx(targetHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        throw new IOException($"Failed to seek target at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                    }
+
+                    // Write to target using native buffer
+                    uint bytesWritten;
+                    if (!WindowsApi.WriteFile(targetHandle, nativeBuffer, bytesToWrite, out bytesWritten, IntPtr.Zero))
+                    {
+                        var error = Marshal.GetLastWin32Error();
+                        throw new IOException($"Failed to write to target at offset {offset}, size {bytesToWrite}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                    }
+
+                    partitionBytesCopied += bytesRead;
+                    offset += bytesRead;
+
+                    // Update progress periodically
+                    if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(250))
+                    {
+                        var currentTotalCopied = totalBytesAlreadyCopied + partitionBytesCopied;
+                        progress.BytesCopied = currentTotalCopied;
+                        progress.ThroughputBytesPerSec = bytesRead / (DateTime.UtcNow - lastProgressUpdate).TotalSeconds;
+                        progress.PercentComplete = (currentTotalCopied * 100.0) / progress.TotalBytes;
+
+                        var remainingBytes = progress.TotalBytes - progress.BytesCopied;
+                        if (progress.ThroughputBytesPerSec > 0)
+                        {
+                            progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(remainingBytes / progress.ThroughputBytesPerSec);
+                        }
+
+                        ReportProgress(progress);
+                        lastProgressUpdate = DateTime.UtcNow;
+                    }
+                }
+
+                // Flush target buffers
+                WindowsApi.FlushFileBuffers(targetHandle);
+            }
+            finally
+            {
+                // Always free the native buffer
+                Marshal.FreeHGlobal(nativeBuffer);
+            }
 
             _logger.Info($"Copied {partitionBytesCopied:N0} bytes for partition {partition.PartitionNumber}");
         });
 
         return totalBytesAlreadyCopied + partitionBytesCopied;
     }
+
 
     /// <summary>
     /// Verifies data integrity by sampling hashes.
