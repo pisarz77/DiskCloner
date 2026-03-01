@@ -230,60 +230,8 @@ public class DiskClonerEngine
         if (operation.PartitionsToClone.Count == 0)
             throw new InvalidOperationException("No partitions selected for cloning");
 
-        // Calculate total required space (including 1MB alignment gaps and overhead)
-        long totalSpaceRequired = 1024 * 1024; // Start with 1MB for MBR/GPT overhead
-        foreach (var p in operation.PartitionsToClone)
-        {
-            totalSpaceRequired += p.SizeBytes;
-            totalSpaceRequired += 1024 * 1024; // Add 1MB alignment buffer per partition
-        }
-
-        if (operation.TargetDisk.SizeBytes < totalSpaceRequired)
-        {
-            if (operation.AllowSmallerTarget)
-            {
-                _logger.Warning($"Target disk is smaller than source partition set. Implementing Magic Auto-Shrink.");
-                
-                // Keep Track of fixed-size partitions (EFI, MSR, Recovery)
-                long reservedSpace = 1024 * 1024; // MBR/GPT
-                foreach (var p in operation.PartitionsToClone)
-                {
-                    if (!p.IsSystemPartition)
-                    {
-                        reservedSpace += p.SizeBytes;
-                        reservedSpace += 1024 * 1024; // Alignment
-                    }
-                }
-
-                long availableForSystem = operation.TargetDisk.SizeBytes - reservedSpace - (1024 * 1024); // Extra 1MB safety
-                if (availableForSystem < (5L * 1024 * 1024 * 1024)) // Min 5GB
-                {
-                    throw new InvalidOperationException($"Target disk is too small even with shrinking. Only {FormatBytes(availableForSystem)} available for Windows.");
-                }
-
-                foreach (var p in operation.PartitionsToClone)
-                {
-                    if (p.IsSystemPartition)
-                    {
-                        p.TargetSizeBytes = availableForSystem;
-                        _logger.Info($"Auto-Shrink: System partition {p.PartitionNumber} will be shrunk from {p.SizeDisplay} to {FormatBytes(availableForSystem)}");
-                    }
-                    else p.TargetSizeBytes = p.SizeBytes;
-                }
-            }
-            else
-            {
-                throw new InvalidOperationException(
-                    $"Target disk ({operation.TargetDisk.SizeDisplay}) is too small to fit the selected partitions. " +
-                    $"Total required space: {FormatBytes(totalSpaceRequired)}. " +
-                    "Check 'Allow smaller target disk' or deselect partitions.");
-            }
-        }
-        else
-        {
-            // Normal case: TargetSizeBytes = SizeBytes
-            foreach (var p in operation.PartitionsToClone) p.TargetSizeBytes = p.SizeBytes;
-        }
+        // Calculate target layout (sizes for partitions on destination)
+        CalculateTargetLayout(operation);
 
         // Verify boot partitions are included
         var hasEfi = operation.PartitionsToClone.Any(p => p.IsEfiPartition);
@@ -342,6 +290,72 @@ public class DiskClonerEngine
 
         progress.StatusMessage = "Target disk prepared and partitioned";
         _logger.Info("Target disk prepared and partitioned");
+    }
+
+    /// <summary>
+    /// Calculates how partitions will fit on the target disk.
+    /// </summary>
+    public void CalculateTargetLayout(CloneOperation operation)
+    {
+        // Calculate total required space (including 1MB alignment gaps and overhead)
+        long totalSpaceRequired = 1024 * 1024; // Start with 1MB for MBR/GPT overhead
+        foreach (var p in operation.PartitionsToClone)
+        {
+            totalSpaceRequired += p.SizeBytes;
+            totalSpaceRequired += 1024 * 1024; // Add 1MB alignment buffer per partition
+        }
+
+        if (operation.TargetDisk.SizeBytes < totalSpaceRequired)
+        {
+            if (operation.AllowSmallerTarget)
+            {
+                // Magic Auto-Shrink Path
+                long reservedSpace = 64L * 1024 * 1024; // GPT headers/safety
+                foreach (var p in operation.PartitionsToClone)
+                {
+                    if (!p.IsSystemPartition)
+                    {
+                        reservedSpace += p.SizeBytes;
+                        reservedSpace += 2 * 1024 * 1024; // 2MB Alignment buffer per partition
+                    }
+                }
+
+                long availableForSystem = operation.TargetDisk.SizeBytes - reservedSpace - (256L * 1024 * 1024); // 256MB safety margin
+                if (availableForSystem < (5L * 1024 * 1024 * 1024)) // Min 5GB
+                {
+                    throw new InvalidOperationException($"Target disk is too small even with shrinking. Only {FormatBytes(availableForSystem)} available for Windows.");
+                }
+
+                // Align to 1MB boundary
+                availableForSystem = (availableForSystem / (1024 * 1024)) * (1024 * 1024);
+
+                foreach (var p in operation.PartitionsToClone)
+                {
+                    if (p.IsSystemPartition)
+                    {
+                        p.TargetSizeBytes = availableForSystem;
+                    }
+                    else 
+                    {
+                        p.TargetSizeBytes = (p.SizeBytes / (1024 * 1024)) * (1024 * 1024);
+                    }
+                }
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Target disk is too small. Required: {FormatBytes(totalSpaceRequired)}. " +
+                    "Enable 'Allow smaller target' to auto-shrink.");
+            }
+        }
+        else
+        {
+            // Normal case: All partitions fit as is
+            foreach (var p in operation.PartitionsToClone)
+            {
+                p.TargetSizeBytes = p.SizeBytes;
+            }
+        }
     }
 
     private string FormatBytes(long bytes)
@@ -443,25 +457,26 @@ public class DiskClonerEngine
 
         foreach (var partition in operation.PartitionsToClone.OrderBy(p => p.StartingOffset))
         {
-            // Align to 1MB boundary
-            var alignedOffset = ((currentOffset + alignment - 1) / alignment) * alignment;
-
             var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
-            var offsetKB = alignedOffset / 1024; // DiskPart offset is in KB
             
-            scriptContent.AppendLine($"create partition primary size={sizeMB} offset={offsetKB}");
-
-            // Set partition type/attributes if needed
+            // REMOVED OFFSET: Let DiskPart handle alignment/placement automatically for better reliability on all controllers
             if (partition.IsEfiPartition)
             {
+                scriptContent.AppendLine($"create partition efi size={sizeMB}");
                 scriptContent.AppendLine("format fs=fat32 quick");
             }
-            else if (partition.IsSystemPartition)
+            else if (partition.IsMsrPartition)
             {
-                scriptContent.AppendLine("format fs=ntfs quick");
+                scriptContent.AppendLine($"create partition msr size={sizeMB}");
             }
-
-            currentOffset = alignedOffset + partition.TargetSizeBytes;
+            else
+            {
+                scriptContent.AppendLine($"create partition primary size={sizeMB}");
+                if (partition.IsSystemPartition)
+                {
+                    scriptContent.AppendLine("format fs=ntfs quick");
+                }
+            }
         }
 
         // List partitions to verify
@@ -491,6 +506,8 @@ public class DiskClonerEngine
                 if (process.ExitCode != 0)
                 {
                     _logger.Error($"diskpart failed with code {process.ExitCode}. Output: {output} Error: {error}");
+                    _logger.Error("Failed DiskPart Script content:");
+                    _logger.Error(scriptContent.ToString());
                     throw new IOException($"Failed to create partitions: DiskPart error {process.ExitCode}. See logs for details.");
                 }
                 else
@@ -1033,6 +1050,9 @@ public class DiskClonerEngine
     /// </summary>
     public string GetOperationSummary(CloneOperation operation)
     {
+        // Ensure layout is calculated before generating summary
+        try { CalculateTargetLayout(operation); } catch { }
+
         var sb = new StringBuilder();
         sb.AppendLine("=== Cloning Operation Summary ===");
         sb.AppendLine();
@@ -1056,10 +1076,23 @@ public class DiskClonerEngine
             sb.AppendLine($"  [{partition.PartitionNumber}] {role}{label} - {partition.SizeDisplay}");
         }
         sb.AppendLine();
+        sb.AppendLine("Planned Target Layout:");
+        foreach (var partition in operation.PartitionsToClone)
+        {
+            var role = partition.GetTypeName();
+            var targetSize = FormatBytes(partition.TargetSizeBytes);
+            var shrinkInfo = (partition.TargetSizeBytes < partition.SizeBytes) 
+                ? $" [SHRUNK from {partition.SizeDisplay}]" 
+                : "";
+            sb.AppendLine($"  [{partition.PartitionNumber}] {role} - {targetSize}{shrinkInfo}");
+        }
+        sb.AppendLine();
+
         sb.AppendLine("Options:");
         sb.AppendLine($"  Use VSS: {operation.UseVss}");
         sb.AppendLine($"  Verify: {operation.VerifyIntegrity} ({(operation.FullHashVerification ? "Full" : "Sampling")})");
         sb.AppendLine($"  Expand C:: {operation.AutoExpandWindowsPartition}");
+        sb.AppendLine($"  Allow Smaller Target: {operation.AllowSmallerTarget}");
         sb.AppendLine();
 
         var estimatedTime = EstimateOperationTime(operation);
