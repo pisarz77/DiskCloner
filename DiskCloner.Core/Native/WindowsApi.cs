@@ -44,6 +44,7 @@ internal static class WindowsApi
     public const uint FSCTL_LOCK_VOLUME = 0x00090018;
     public const uint FSCTL_DISMOUNT_VOLUME = 0x00090020;
     public const uint FSCTL_UNLOCK_VOLUME = 0x0009001C;
+    public const uint FSCTL_ALLOW_EXTENDED_DASD_IO = 0x00090028;
     public const uint FSCTL_GET_VOLUME_BITMAP = 0x0009003F;
     public const uint FSCTL_EXTEND_VOLUME = 0x000900F0;
     public const uint IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS = 0x00560000;
@@ -307,7 +308,7 @@ internal static class WindowsApi
     public static extern bool FlushFileBuffers(SafeFileHandle hFile);
 
     [DllImport("kernel32.dll", SetLastError = true)]
-    public static extern uint GetLastError();
+    internal static extern uint GetLastError();
 
     [DllImport("kernel32.dll", CharSet = CharSet.Auto)]
     public static extern uint FormatMessage(
@@ -331,8 +332,8 @@ internal static class WindowsApi
     /// </summary>
     public static string GetLastErrorMessage()
     {
-        uint error = GetLastError();
-        return GetErrorMessage(error);
+        int error = Marshal.GetLastWin32Error();
+        return GetErrorMessage((uint)error);
     }
 
     /// <summary>
@@ -357,7 +358,7 @@ internal static class WindowsApi
     /// </summary>
     public static Win32Exception GetLastException()
     {
-        return new Win32Exception((int)GetLastError());
+        return new Win32Exception(Marshal.GetLastWin32Error());
     }
 
     /// <summary>

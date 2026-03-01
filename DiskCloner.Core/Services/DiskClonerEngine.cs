@@ -1,6 +1,7 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -407,7 +408,10 @@ public class DiskClonerEngine
                 IntPtr.Zero);
 
             if (!result)
-                throw new IOException($"Failed to clear target disk: {WindowsApi.GetLastErrorMessage()}");
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"Failed to clear target disk: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+            }
 
             WindowsApi.FlushFileBuffers(handle);
             _logger.Info($"Cleared {bytesWritten} bytes from target disk");
@@ -441,6 +445,10 @@ public class DiskClonerEngine
 
         scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
         scriptContent.AppendLine("clean");
+        scriptContent.AppendLine("attributes disk set readonly=no"); // Ensure writable
+        scriptContent.AppendLine("offline disk"); // Offline to prevent interference
+        scriptContent.AppendLine("online disk");  // Online to partition
+        scriptContent.AppendLine("convert gpt noerr");
 
         if (operation.SourceDisk.IsGpt)
         {
@@ -459,11 +467,9 @@ public class DiskClonerEngine
         {
             var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
             
-            // REMOVED OFFSET: Let DiskPart handle alignment/placement automatically for better reliability on all controllers
             if (partition.IsEfiPartition)
             {
                 scriptContent.AppendLine($"create partition efi size={sizeMB}");
-                scriptContent.AppendLine("format fs=fat32 quick");
             }
             else if (partition.IsMsrPartition)
             {
@@ -474,8 +480,9 @@ public class DiskClonerEngine
                 scriptContent.AppendLine($"create partition primary size={sizeMB}");
                 if (partition.IsSystemPartition)
                 {
-                    scriptContent.AppendLine("format fs=ntfs quick");
+                    scriptContent.AppendLine("set id=\"ebd0a0a2-b9e5-4433-87c0-68b6b72699c7\""); // Basic Data
                 }
+                scriptContent.AppendLine("gpt attributes=0x8000000000000000"); // No Default Drive Letter
             }
         }
 
@@ -557,14 +564,20 @@ public class DiskClonerEngine
             using var targetHandle = WindowsApi.CreateFile(
                 targetPath,
                 WindowsApi.GENERIC_WRITE,
-                WindowsApi.FILE_SHARE_WRITE,
+                0, // Exclusive access if possible, or 0
                 IntPtr.Zero,
                 WindowsApi.OPEN_EXISTING,
-                0,
+                0, // Removed NO_BUFFERING to avoid alignment issues with managed byte[]
                 IntPtr.Zero);
 
             if (targetHandle.IsInvalid)
-                throw new IOException($"Failed to open target disk: {WindowsApi.GetLastErrorMessage()}");
+                throw new IOException($"Failed to open target disk for writing: {WindowsApi.GetLastErrorMessage()}");
+
+            // Attempt to dismount volumes on the disk to ensure we can write to sectors
+            uint bytesReturned;
+            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_ALLOW_EXTENDED_DASD_IO, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
+            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_LOCK_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
+            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_DISMOUNT_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
 
             // Align buffer to sector size
             bufferSize = ((bufferSize + 511) / 512) * 512;
@@ -585,21 +598,33 @@ public class DiskClonerEngine
 
                 // Seek to source position
                 if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
-                    throw new IOException($"Failed to seek source: {WindowsApi.GetLastErrorMessage()}");
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new IOException($"Failed to seek source: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                }
 
                 // Seek to target position
                 if (!WindowsApi.SetFilePointerEx(targetHandle, offset, out _, WindowsApi.FILE_BEGIN))
-                    throw new IOException($"Failed to seek target: {WindowsApi.GetLastErrorMessage()}");
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new IOException($"Failed to seek target: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                }
 
                 // Read from source
                 uint bytesRead;
                 if (!WindowsApi.ReadFile(sourceHandle, buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
-                    throw new IOException($"Failed to read from source: {WindowsApi.GetLastErrorMessage()}");
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new IOException($"Failed to read from source: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                }
 
                 // Write to target
                 uint bytesWritten;
                 if (!WindowsApi.WriteFile(targetHandle, buffer, bytesRead, out bytesWritten, IntPtr.Zero))
-                    throw new IOException($"Failed to write to target: {WindowsApi.GetLastErrorMessage()}");
+                {
+                    var error = Marshal.GetLastWin32Error();
+                    throw new IOException($"Failed to write to target: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                }
 
                 partitionBytesCopied += bytesRead;
                 offset += bytesRead;
