@@ -1,7 +1,9 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
+using Microsoft.Win32.SafeHandles;
 using System.Management;
+using System.Runtime.InteropServices;
 
 namespace DiskCloner.Core.Services;
 
@@ -180,8 +182,8 @@ public class DiskEnumerator
                             PartitionNumber = Convert.ToInt32(partitionObj["Index"]) + 1,
                             StartingOffset = Convert.ToInt64(partitionObj["StartingOffset"]),
                             SizeBytes = Convert.ToInt64(partitionObj["Size"]),
-                            IsActive = Convert.ToBoolean(partitionObj["Bootable"] ||
-                                                       partitionObj["PrimaryPartition"])
+                            IsActive = Convert.ToBoolean((partitionObj["Bootable"] as bool? ?? false) ||
+                                                       (partitionObj["PrimaryPartition"] as bool? ?? false))
                         };
 
                         // Get logical disks for this partition
@@ -450,10 +452,9 @@ public class DiskEnumerator
         try
         {
             var path = $@"\\.\PhysicalDrive{diskNumber}";
-
-            await Task.Run(() =>
+            var result = await Task.Run<bool>(() =>
             {
-                using var handle = WindowsApi.CreateFile(
+                var handlePtr = WindowsApi.CreateFile(
                     path,
                     WindowsApi.GENERIC_READ,
                     WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
@@ -462,45 +463,58 @@ public class DiskEnumerator
                     0,
                     IntPtr.Zero);
 
-                if (handle == WindowsApi.INVALID_HANDLE_VALUE)
+                var handle = new SafeFileHandle(handlePtr, true);
+
+                if (handle.IsInvalid)
                 {
                     var error = WindowsApi.GetLastError();
                     _logger.Error($"Failed to open disk {diskNumber}: {WindowsApi.GetErrorMessage(error)}");
                     return false;
                 }
 
-                // Try to get geometry
-                var size = Marshal.SizeOf<WindowsApi.DISK_GEOMETRY>();
-                var buffer = Marshal.AllocHGlobal(size);
-
                 try
                 {
-                    uint bytesReturned;
-                    bool result = WindowsApi.DeviceIoControl(
-                        handle,
-                        WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                        IntPtr.Zero,
-                        0,
-                        buffer,
-                        size,
-                        out bytesReturned,
-                        IntPtr.Zero);
+                    // Try to get geometry
+                    var size = Marshal.SizeOf<WindowsApi.DISK_GEOMETRY>();
+                    var buffer = Marshal.AllocHGlobal(size);
 
-                    if (!result)
+                    try
                     {
-                        var error = WindowsApi.GetLastError();
-                        _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
-                        return false;
+                        uint bytesReturned;
+                        bool result = WindowsApi.DeviceIoControl(
+                            handle.DangerousGetHandle(),
+                            WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                            IntPtr.Zero,
+                            0,
+                            buffer,
+                            size,
+                            out bytesReturned,
+                            IntPtr.Zero);
+
+                        if (!result)
+                        {
+                            var error = WindowsApi.GetLastError();
+                            _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
+                            return false;
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(buffer);
                     }
                 }
                 finally
                 {
-                    Marshal.FreeHGlobal(buffer);
+                    handle.Dispose();
                 }
+
+                return true;
             });
 
-            _logger.Info($"Disk {diskNumber} is accessible");
-            return true;
+            if (result)
+                _logger.Info($"Disk {diskNumber} is accessible");
+
+            return result;
         }
         catch (Exception ex)
         {

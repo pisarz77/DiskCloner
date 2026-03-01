@@ -1,6 +1,7 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
+using Microsoft.Win32.SafeHandles;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -148,7 +149,7 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             result.Success = true;
-            _logger.Info($"Cloning completed successfully in {result.Duration:hh\:mm\:ss}");
+            _logger.Info($"Cloning completed successfully in {result.Duration.TotalHours:0}h {result.Duration.Minutes}m {result.Duration.Seconds}s");
 
             return result;
         }
@@ -308,7 +309,7 @@ public class DiskClonerEngine
 
         await Task.Run(() =>
         {
-            using var handle = WindowsApi.CreateFile(
+            var handlePtr = WindowsApi.CreateFile(
                 path,
                 WindowsApi.GENERIC_WRITE,
                 WindowsApi.FILE_SHARE_WRITE,
@@ -317,7 +318,9 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-            if (handle == WindowsApi.INVALID_HANDLE_VALUE)
+            var handle = new SafeFileHandle(handlePtr, true);
+
+            if (handle.IsInvalid)
                 throw new IOException($"Failed to open target disk: {WindowsApi.GetLastErrorMessage()}");
 
             try
@@ -328,7 +331,7 @@ public class DiskClonerEngine
 
                 uint bytesWritten;
                 bool result = WindowsApi.WriteFile(
-                    handle,
+                handle.DangerousGetHandle(),
                     buffer,
                     (uint)bufferSize,
                     out bytesWritten,
@@ -337,12 +340,12 @@ public class DiskClonerEngine
                 if (!result)
                     throw new IOException($"Failed to clear target disk: {WindowsApi.GetLastErrorMessage()}");
 
-                WindowsApi.FlushFileBuffers(handle);
+                WindowsApi.FlushFileBuffers(handle.DangerousGetHandle());
                 _logger.Info($"Cleared {bytesWritten} bytes from target disk");
             }
             finally
             {
-                WindowsApi.CloseHandle(handle);
+                handle.Dispose();
             }
         });
     }
@@ -385,15 +388,17 @@ public class DiskClonerEngine
         }
 
         // Create partitions matching the source
-        var alignment = 1024 * 1024; // 1MB alignment
-        var currentOffset = 1024 * 1024; // Start at 1MB
+        var alignment = 1024L * 1024; // 1MB alignment
+        var currentOffset = 1024L * 1024; // Start at 1MB
 
         foreach (var partition in operation.PartitionsToClone.OrderBy(p => p.StartingOffset))
         {
             // Align to 1MB boundary
             var alignedOffset = ((currentOffset + alignment - 1) / alignment) * alignment;
 
-            scriptContent.AppendLine($"create partition primary size={(partition.SizeBytes / (1024 * 1024))} offset={(alignedOffset / 1024 / 1024)}");
+            var sizeMB = partition.SizeBytes / (1024 * 1024);
+            var offsetMB = alignedOffset / 1024 / 1024;
+            scriptContent.AppendLine($"create partition primary size={sizeMB} offset={offsetMB}");
 
             // Set partition type/attributes if needed
             if (partition.IsEfiPartition)
@@ -465,7 +470,7 @@ public class DiskClonerEngine
 
         await Task.Run(() =>
         {
-            using var sourceHandle = WindowsApi.CreateFile(
+            var sourceHandlePtr = WindowsApi.CreateFile(
                 sourcePath,
                 WindowsApi.GENERIC_READ,
                 WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
@@ -474,7 +479,7 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-            using var targetHandle = WindowsApi.CreateFile(
+            var targetHandlePtr = WindowsApi.CreateFile(
                 targetPath,
                 WindowsApi.GENERIC_WRITE,
                 WindowsApi.FILE_SHARE_WRITE,
@@ -483,10 +488,13 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-            if (sourceHandle == WindowsApi.INVALID_HANDLE_VALUE)
+            var sourceHandle = new SafeFileHandle(sourceHandlePtr, true);
+            var targetHandle = new SafeFileHandle(targetHandlePtr, true);
+
+            if (sourceHandle.IsInvalid)
                 throw new IOException($"Failed to open source disk: {WindowsApi.GetLastErrorMessage()}");
 
-            if (targetHandle == WindowsApi.INVALID_HANDLE_VALUE)
+            if (targetHandle.IsInvalid)
                 throw new IOException($"Failed to open target disk: {WindowsApi.GetLastErrorMessage()}");
 
             // Align buffer to sector size
@@ -507,21 +515,21 @@ public class DiskClonerEngine
                 var bytesToRead = (int)Math.Min(bufferSize, totalBytes - bytesCopied);
 
                 // Seek to source position
-                if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                if (!WindowsApi.SetFilePointerEx(sourceHandle.DangerousGetHandle(), offset, out _, WindowsApi.FILE_BEGIN))
                     throw new IOException($"Failed to seek source: {WindowsApi.GetLastErrorMessage()}");
 
                 // Seek to target position
-                if (!WindowsApi.SetFilePointerEx(targetHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                if (!WindowsApi.SetFilePointerEx(targetHandle.DangerousGetHandle(), offset, out _, WindowsApi.FILE_BEGIN))
                     throw new IOException($"Failed to seek target: {WindowsApi.GetLastErrorMessage()}");
 
                 // Read from source
                 uint bytesRead;
-                if (!WindowsApi.ReadFile(sourceHandle, buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
+                if (!WindowsApi.ReadFile(sourceHandle.DangerousGetHandle(), buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
                     throw new IOException($"Failed to read from source: {WindowsApi.GetLastErrorMessage()}");
 
                 // Write to target
                 uint bytesWritten;
-                if (!WindowsApi.WriteFile(targetHandle, buffer, bytesRead, out bytesWritten, IntPtr.Zero))
+                if (!WindowsApi.WriteFile(targetHandle.DangerousGetHandle(), buffer, bytesRead, out bytesWritten, IntPtr.Zero))
                     throw new IOException($"Failed to write to target: {WindowsApi.GetLastErrorMessage()}");
 
                 bytesCopied += bytesRead;
@@ -546,7 +554,11 @@ public class DiskClonerEngine
             }
 
             // Flush target buffers
-            WindowsApi.FlushFileBuffers(targetHandle);
+            WindowsApi.FlushFileBuffers(targetHandle.DangerousGetHandle());
+
+            // Clean up handles
+            sourceHandle.Dispose();
+            targetHandle.Dispose();
 
             _logger.Info($"Copied {bytesCopied:N0} bytes for partition {partition.PartitionNumber}");
         });
@@ -702,7 +714,7 @@ public class DiskClonerEngine
 
         await Task.Run(() =>
         {
-            using var handle = WindowsApi.CreateFile(
+            var handlePtr = WindowsApi.CreateFile(
                 path,
                 WindowsApi.GENERIC_READ,
                 WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
@@ -711,27 +723,36 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-            if (handle == WindowsApi.INVALID_HANDLE_VALUE)
+            var handle = new SafeFileHandle(handlePtr, true);
+
+            if (handle.IsInvalid)
                 throw new IOException($"Failed to open disk {diskNumber}: {WindowsApi.GetLastErrorMessage()}");
 
-            while (bytesRemaining > 0)
+            try
             {
-                var bytesToRead = (int)Math.Min(bufferSize, bytesRemaining);
+                while (bytesRemaining > 0)
+                {
+                    var bytesToRead = (int)Math.Min(bufferSize, bytesRemaining);
 
-                if (!WindowsApi.SetFilePointerEx(handle, offset, out _, WindowsApi.FILE_BEGIN))
-                    throw new IOException($"Failed to seek: {WindowsApi.GetLastErrorMessage()}");
+                    if (!WindowsApi.SetFilePointerEx(handle.DangerousGetHandle(), offset, out _, WindowsApi.FILE_BEGIN))
+                        throw new IOException($"Failed to seek: {WindowsApi.GetLastErrorMessage()}");
 
-                uint bytesRead;
-                if (!WindowsApi.ReadFile(handle, buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
-                    throw new IOException($"Failed to read: {WindowsApi.GetLastErrorMessage()}");
+                    uint bytesRead;
+                    if (!WindowsApi.ReadFile(handle.DangerousGetHandle(), buffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
+                        throw new IOException($"Failed to read: {WindowsApi.GetLastErrorMessage()}");
 
-                hashAlgorithm.TransformBlock(buffer, 0, (int)bytesRead, null, 0);
+                    hashAlgorithm.TransformBlock(buffer, 0, (int)bytesRead, null, 0);
 
-                bytesRemaining -= bytesRead;
-                offset += bytesRead;
+                    bytesRemaining -= bytesRead;
+                    offset += bytesRead;
+                }
+
+                hashAlgorithm.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
             }
-
-            hashAlgorithm.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            finally
+            {
+                handle.Dispose();
+            }
         });
 
         return hashAlgorithm.Hash ?? Array.Empty<byte>();
@@ -833,7 +854,7 @@ public class DiskClonerEngine
         {
             var path = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
 
-            using var handle = WindowsApi.CreateFile(
+            var handlePtr = WindowsApi.CreateFile(
                 path,
                 WindowsApi.GENERIC_READ,
                 WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
@@ -842,20 +863,29 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-            if (handle == WindowsApi.INVALID_HANDLE_VALUE)
+            var handle = new SafeFileHandle(handlePtr, true);
+
+            if (handle.IsInvalid)
                 return;
 
-            // Update disk properties
-            uint bytesReturned;
-            WindowsApi.DeviceIoControl(
-                handle,
-                WindowsApi.IOCTL_DISK_UPDATE_PROPERTIES,
-                IntPtr.Zero,
-                0,
-                IntPtr.Zero,
-                0,
-                out bytesReturned,
-                IntPtr.Zero);
+            try
+            {
+                // Update disk properties
+                uint bytesReturned;
+                WindowsApi.DeviceIoControl(
+                    handle.DangerousGetHandle(),
+                    WindowsApi.IOCTL_DISK_UPDATE_PROPERTIES,
+                    IntPtr.Zero,
+                    0,
+                    IntPtr.Zero,
+                    0,
+                    out bytesReturned,
+                    IntPtr.Zero);
+            }
+            finally
+            {
+                handle.Dispose();
+            }
         });
     }
 
@@ -893,7 +923,7 @@ public class DiskClonerEngine
 
             await Task.Run(() =>
             {
-                using var handle = WindowsApi.CreateFile(
+                var handlePtr = WindowsApi.CreateFile(
                     path,
                     WindowsApi.GENERIC_WRITE,
                     WindowsApi.FILE_SHARE_WRITE,
@@ -902,14 +932,23 @@ public class DiskClonerEngine
                     0,
                     IntPtr.Zero);
 
-                if (handle == WindowsApi.INVALID_HANDLE_VALUE)
+                var handle = new SafeFileHandle(handlePtr, true);
+
+                if (handle.IsInvalid)
                     return;
 
-                // Write an incomplete marker to the first sector
-                var buffer = Encoding.ASCII.GetBytes("INCOMPLETE CLONE");
-                WindowsApi.SetFilePointerEx(handle, 0, out _, WindowsApi.FILE_BEGIN);
-                WindowsApi.WriteFile(handle, buffer, (uint)buffer.Length, out _, IntPtr.Zero);
-                WindowsApi.FlushFileBuffers(handle);
+                try
+                {
+                    // Write an incomplete marker to the first sector
+                    var buffer = Encoding.ASCII.GetBytes("INCOMPLETE CLONE");
+                    WindowsApi.SetFilePointerEx(handle.DangerousGetHandle(), 0, out _, WindowsApi.FILE_BEGIN);
+                    WindowsApi.WriteFile(handle.DangerousGetHandle(), buffer, (uint)buffer.Length, out _, IntPtr.Zero);
+                    WindowsApi.FlushFileBuffers(handle.DangerousGetHandle());
+                }
+                finally
+                {
+                    handle.Dispose();
+                }
             });
 
             _logger.Info("Target disk marked as incomplete");

@@ -154,7 +154,7 @@
             </TabItem>
 
             <!-- Step 3: Preview -->
-            <TabItem Header="3. Preview & Confirm">
+            <TabItem Header="3. Preview &amp; Confirm">
                 <ScrollViewer VerticalScrollBarVisibility="Auto">
                     <StackPanel Margin="20">
                         <TextBlock FontSize="18" FontWeight="Bold" Text="Operation Preview" Margin="0,0,0,20"/>

@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -78,7 +79,7 @@ internal static class WindowsApi
     {
         public DISK_GEOMETRY Geometry;
         public long DiskSize;
-        public byte Data[1]; // Variable length data follows
+        public byte Data; // Placeholder for variable length data
     }
 
     [StructLayout(LayoutKind.Sequential)]

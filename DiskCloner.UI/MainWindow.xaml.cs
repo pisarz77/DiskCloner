@@ -2,6 +2,7 @@ using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Services;
 using System.Diagnostics;
+using System.IO;
 using System.Windows;
 
 namespace DiskCloner.UI;
