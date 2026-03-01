@@ -654,7 +654,7 @@ public class DiskClonerEngine
             var sourceHash = await ComputeHashAsync(
                 operation.SourceDisk.DiskNumber,
                 offset,
-                partition.SizeBytes,
+                partition.TargetSizeBytes,
                 bufferSize,
                 sha256);
 
@@ -662,7 +662,7 @@ public class DiskClonerEngine
             var targetHash = await ComputeHashAsync(
                 operation.TargetDisk.DiskNumber,
                 offset,
-                partition.SizeBytes,
+                partition.TargetSizeBytes,
                 bufferSize,
                 sha256);
 
@@ -672,7 +672,7 @@ public class DiskClonerEngine
                 return false;
             }
 
-            totalChecked += partition.SizeBytes;
+            totalChecked += partition.TargetSizeBytes;
             progress.BytesCopied = totalChecked;
             ReportProgress(progress);
         }
@@ -705,15 +705,15 @@ public class DiskClonerEngine
 
                 // Calculate sample position
                 var sampleOffset = partition.StartingOffset +
-                    (partition.SizeBytes * i / sampleCount);
+                    (partition.TargetSizeBytes * i / sampleCount);
 
                 // Ensure we don't go past the end
                 sampleOffset = Math.Min(sampleOffset,
-                    partition.StartingOffset + partition.SizeBytes - bufferSize);
+                    partition.StartingOffset + partition.TargetSizeBytes - bufferSize);
 
                 // Calculate actual sample size (might be smaller near the end)
                 var sampleSize = Math.Min(bufferSize,
-                    partition.StartingOffset + partition.SizeBytes - sampleOffset);
+                    partition.StartingOffset + partition.TargetSizeBytes - sampleOffset);
 
                 using var sha256 = SHA256.Create();
 
