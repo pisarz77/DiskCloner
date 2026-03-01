@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.UI", "DiskCloner
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.Core", "DiskCloner.Core\DiskCloner.Core.csproj", "{9C5B2E6G-3F4D-5B8C-0G9E-2D3F4A5B6C7E}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.Tests", "DiskCloner.Tests\DiskCloner.Tests.csproj", "{7D3C4F9A-1B2E-5C8D-9E0F-2A3B4C5D6E7F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
