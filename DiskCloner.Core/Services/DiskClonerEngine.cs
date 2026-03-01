@@ -106,6 +106,9 @@ public class DiskClonerEngine
 
             result.BytesCopied = bytesCopied;
 
+            // Bring the target disk back online before verification/expansion
+            await OnlineTargetDiskAsync(operation);
+
             // Step 5: Verify data integrity
             if (operation.VerifyIntegrity)
             {
@@ -489,6 +492,12 @@ public class DiskClonerEngine
         // List partitions to verify
         scriptContent.AppendLine("list partition");
 
+        // Take disk offline so Windows releases all volume mounts
+        // This is CRITICAL: without this, WriteFile to the PhysicalDrive will fail
+        // because Windows blocks writes to disks with mounted volumes.
+        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
+        scriptContent.AppendLine("offline disk");
+
         await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
 
         try
@@ -561,23 +570,24 @@ public class DiskClonerEngine
             if (sourceHandle.IsInvalid)
                 throw new IOException($"Failed to open source disk: {WindowsApi.GetLastErrorMessage()}");
 
+            // Open target with READ+WRITE (both needed for raw physical disk I/O)
+            // The disk should be OFFLINE at this point (set by diskpart), so no mounted volumes block us.
             using var targetHandle = WindowsApi.CreateFile(
                 targetPath,
-                WindowsApi.GENERIC_WRITE,
-                0, // Exclusive access if possible, or 0
+                WindowsApi.GENERIC_READ_WRITE,
+                WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
                 IntPtr.Zero,
                 WindowsApi.OPEN_EXISTING,
-                0, // Removed NO_BUFFERING to avoid alignment issues with managed byte[]
+                0,
                 IntPtr.Zero);
 
             if (targetHandle.IsInvalid)
-                throw new IOException($"Failed to open target disk for writing: {WindowsApi.GetLastErrorMessage()}");
+            {
+                var error = Marshal.GetLastWin32Error();
+                throw new IOException($"Failed to open target disk for writing: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+            }
 
-            // Attempt to dismount volumes on the disk to ensure we can write to sectors
-            uint bytesReturned;
-            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_ALLOW_EXTENDED_DASD_IO, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
-            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_LOCK_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
-            WindowsApi.DeviceIoControl(targetHandle, WindowsApi.FSCTL_DISMOUNT_VOLUME, IntPtr.Zero, 0, IntPtr.Zero, 0, out bytesReturned, IntPtr.Zero);
+            _logger.Info($"Target disk handle opened successfully for partition {partition.PartitionNumber}");
 
             // Align buffer to sector size
             bufferSize = ((bufferSize + 511) / 512) * 512;
@@ -960,6 +970,61 @@ public class DiskClonerEngine
                 out bytesReturned,
                 IntPtr.Zero);
         });
+    }
+
+    /// <summary>
+    /// Brings the target disk back online after raw copy is complete.
+    /// Must be called after CopyPartitionAsync finishes so that verification,
+    /// expansion, and boot configuration can access the disk normally.
+    /// </summary>
+    private async Task OnlineTargetDiskAsync(CloneOperation operation)
+    {
+        _logger.Info($"Bringing target disk {operation.TargetDisk.DiskNumber} back online...");
+
+        var scriptPath = Path.GetTempFileName();
+        var scriptContent = new StringBuilder();
+        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
+        scriptContent.AppendLine("online disk");
+        scriptContent.AppendLine("attributes disk clear readonly");
+
+        await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
+
+        try
+        {
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "diskpart.exe",
+                Arguments = $"/s \"{scriptPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            using var process = System.Diagnostics.Process.Start(startInfo);
+            if (process != null)
+            {
+                var output = await process.StandardOutput.ReadToEndAsync();
+                var error = await process.StandardError.ReadToEndAsync();
+                await process.WaitForExitAsync();
+
+                if (process.ExitCode != 0)
+                {
+                    _logger.Warning($"diskpart online failed with code {process.ExitCode}. Output: {output}");
+                }
+                else
+                {
+                    _logger.Info("Target disk brought back online successfully");
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(scriptPath); } catch { }
+        }
+
+        // Give Windows a moment to mount volumes
+        await Task.Delay(2000);
     }
 
     /// <summary>
