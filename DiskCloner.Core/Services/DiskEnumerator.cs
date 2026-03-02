@@ -540,19 +540,22 @@ public class DiskEnumerator
     /// </summary>
     private bool DeterminePartitionStyle(ManagementObject diskObj)
     {
-        try 
+        try
         {
-            // Check for Partitions property (count of partitions)
-            var partitionCount = GetInt32OrDefault(diskObj["Partitions"]);
-            
-            // On Win32_DiskDrive, there isn't a direct "PartitionStyle" property.
-            // However, we can infer it or just default to GPT for large modern disks.
-            // A more accurate way is to check the signature.
+            // Prefer DeviceIoControl for an authoritative partition style when possible
+            var indexObj = diskObj["Index"];
+            if (indexObj != null && int.TryParse(indexObj.ToString(), out var diskIndex))
+            {
+                if (TryGetPartitionStyle(diskIndex, out var isGpt))
+                {
+                    return isGpt;
+                }
+            }
+
+            // Fallback: inspect signature (MBR usually has a non-zero signature)
             var signature = diskObj["Signature"]?.ToString();
             if (!string.IsNullOrEmpty(signature))
             {
-                // MBR signatures are usually simple integers (often < 10 digits as string)
-                // GPT doesn't use the Signature field in Win32_DiskDrive in the same way.
                 if (long.TryParse(signature, out var sigLong) && sigLong != 0)
                 {
                     return false; // Likely MBR
@@ -563,6 +566,42 @@ public class DiskEnumerator
 
         // Default to GPT for modern Windows/NVMe
         return true;
+    }
+
+    private bool TryGetPartitionStyle(int diskNumber, out bool isGpt)
+    {
+        isGpt = false;
+        try
+        {
+            var path = $"\\.\\PhysicalDrive{diskNumber}";
+            using var handle = WindowsApi.CreateFile(path, WindowsApi.GENERIC_READ, WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE, IntPtr.Zero, WindowsApi.OPEN_EXISTING, 0, IntPtr.Zero);
+            if (handle.IsInvalid)
+                return false;
+
+            const int outSize = 4096;
+            var outBuffer = Marshal.AllocHGlobal(outSize);
+            try
+            {
+                if (WindowsApi.DeviceIoControl(handle, WindowsApi.IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IntPtr.Zero, 0, outBuffer, outSize, out uint bytesReturned, IntPtr.Zero))
+                {
+                    // DRIVE_LAYOUT_INFORMATION_EX.PartitionStyle is the first int
+                    var partitionStyle = Marshal.ReadInt32(outBuffer);
+                    // 0 = MBR, 1 = GPT
+                    isGpt = partitionStyle == 1;
+                    return true;
+                }
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(outBuffer);
+            }
+        }
+        catch
+        {
+            // best-effort only
+        }
+
+        return false;
     }
 
     /// <summary>

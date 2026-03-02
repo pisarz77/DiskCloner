@@ -15,8 +15,9 @@ namespace DiskCloner.Core.Services;
 /// </summary>
 public class DiskClonerEngine
 {
+    // More tolerant regex to handle locale decimal separators, optional asterisk, extra trailing columns
     private static readonly Regex DiskPartPartitionLineRegex = new(
-        @"^\s*\*?\s*Partition\s+(?<number>\d+)\s+(?<type>.+?)\s+(?<sizeValue>\d+(?:[.,]\d+)?)\s+(?<sizeUnit>KB|MB|GB|TB)\s+(?<offsetValue>\d+(?:[.,]\d+)?)\s+(?<offsetUnit>KB|MB|GB|TB)\s*$",
+        @"^\s*\*?\s*Partition\s+(?<number>\d+)\s+(?<type>.+?)\s+(?<sizeValue>\d+[\d.,]*)\s+(?<sizeUnit>KB|MB|GB|TB|B|Bytes)?\s+(?<offsetValue>\d+[\d.,]*)\s+(?<offsetUnit>KB|MB|GB|TB|B|Bytes)?(\s+.*)?$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
     private readonly ILogger _logger;
@@ -72,7 +73,7 @@ public class DiskClonerEngine
                     .Distinct()
                     .ToList();
 
-                await _vssService.CreateSnapshotsAsync(volumesToSnapshot);
+                await _vssService.CreateSnapshotsForVolumesAsync(volumesToSnapshot);
             }
 
             // Step 3: Prepare target disk
@@ -554,7 +555,7 @@ public class DiskClonerEngine
             {
                 var output = await process.StandardOutput.ReadToEndAsync();
                 var error = await process.StandardError.ReadToEndAsync();
-                await process.WaitForExitAsync();
+                await process.WaitForExitAsync(_cancellationTokenSource.Token);
 
                 _logger.Info($"DiskPart output: {output}");
 
@@ -603,6 +604,7 @@ public class DiskClonerEngine
         }
 
         int targetSearchStart = 0;
+        long lastAssignedOffset = -1;
         for (int i = 0; i < sourcePartitions.Count; i++)
         {
             var sourcePartition = sourcePartitions[i];
@@ -627,7 +629,22 @@ public class DiskClonerEngine
             }
 
             var targetPartition = targetPartitions[mappedTargetIndex];
+            // Sanity checks before assigning offsets to avoid accidental overwrites
+            if (targetPartition.StartingOffsetBytes <= 0)
+            {
+                throw new InvalidOperationException($"Parsed target partition {targetPartition.PartitionNumber} has invalid starting offset {targetPartition.StartingOffsetBytes}.");
+            }
+            if (lastAssignedOffset >= 0 && targetPartition.StartingOffsetBytes <= lastAssignedOffset)
+            {
+                throw new InvalidOperationException($"Parsed target partition offsets are not strictly increasing (partition {targetPartition.PartitionNumber} offset {targetPartition.StartingOffsetBytes}). Aborting.");
+            }
+            if (!operation.AllowSmallerTarget && targetPartition.SizeBytes < sourcePartition.SizeBytes)
+            {
+                throw new InvalidOperationException($"Target partition {targetPartition.PartitionNumber} is smaller ({targetPartition.SizeBytes} bytes) than source partition {sourcePartition.PartitionNumber} ({sourcePartition.SizeBytes} bytes). Aborting to avoid data truncation.");
+            }
+
             sourcePartition.TargetStartingOffset = targetPartition.StartingOffsetBytes;
+            lastAssignedOffset = targetPartition.StartingOffsetBytes;
             targetSearchStart = mappedTargetIndex + 1;
 
             _logger.Info(
@@ -639,29 +656,71 @@ public class DiskClonerEngine
     private static List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)> ParsePartitionTableFromDiskPartOutput(string output)
     {
         var result = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+        if (string.IsNullOrWhiteSpace(output))
+            return result;
+
         var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
 
-        foreach (var line in lines)
+        foreach (var rawLine in lines)
         {
-            var match = DiskPartPartitionLineRegex.Match(line);
-            if (!match.Success)
+            var line = rawLine.Trim();
+            if (string.IsNullOrEmpty(line))
                 continue;
 
-            var partitionNumber = int.Parse(match.Groups["number"].Value, CultureInfo.InvariantCulture);
-            var typeName = NormalizeDiskPartType(match.Groups["type"].Value);
-            var sizeValue = match.Groups["sizeValue"].Value;
-            var sizeUnit = match.Groups["sizeUnit"].Value;
-            var offsetValue = match.Groups["offsetValue"].Value;
-            var offsetUnit = match.Groups["offsetUnit"].Value;
-            var sizeBytes = ParseSizeToBytes(sizeValue, sizeUnit);
-            var offsetBytes = ParseSizeToBytes(offsetValue, offsetUnit);
+            var match = DiskPartPartitionLineRegex.Match(line);
+            if (!match.Success)
+            {
+                // Try a very permissive whitespace-split fallback: Partition <num> <type> <size> <unit> <offset> <unit>
+                var tokens = line.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (tokens.Length >= 6 && tokens[0].Equals("Partition", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (int.TryParse(tokens[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var num))
+                    {
+                        // Reconstruct type as the token(s) between number and last 4 tokens
+                        var tail = tokens.Skip(Math.Max(0, tokens.Length - 4)).ToArray();
+                        var typeTokens = tokens.Skip(2).Take(tokens.Length - 6).ToArray();
+                        var typeText = typeTokens.Length > 0 ? string.Join(' ', typeTokens) : tokens[2];
+                        var sizeText = tail[0];
+                        var sizeUnit = tail[1];
+                        var offsetText = tail[2];
+                        var offsetUnit = tail[3];
 
-            result.Add((partitionNumber, typeName, sizeBytes, offsetBytes));
+                        if (TryParseSizeToBytes(sizeText, sizeUnit, out var sBytes) && TryParseSizeToBytes(offsetText, offsetUnit, out var oBytes))
+                        {
+                            result.Add((num, NormalizeDiskPartType(typeText), sBytes, oBytes));
+                            continue;
+                        }
+                    }
+                }
+
+                // Could not parse line - skip it
+                continue;
+            }
+
+            try
+            {
+                var partitionNumber = int.Parse(match.Groups["number"].Value, CultureInfo.InvariantCulture);
+                var typeName = NormalizeDiskPartType(match.Groups["type"].Value);
+                var sizeValue = match.Groups["sizeValue"].Value;
+                var sizeUnit = match.Groups["sizeUnit"].Value;
+                var offsetValue = match.Groups["offsetValue"].Value;
+                var offsetUnit = match.Groups["offsetUnit"].Value;
+
+                if (!TryParseSizeToBytes(sizeValue, sizeUnit, out var sizeBytes))
+                    continue;
+                if (!TryParseSizeToBytes(offsetValue, offsetUnit, out var offsetBytes))
+                    continue;
+
+                result.Add((partitionNumber, typeName, sizeBytes, offsetBytes));
+            }
+            catch
+            {
+                // Defensive: skip malformed lines rather than throw
+                continue;
+            }
         }
 
-        return result
-            .OrderBy(p => p.StartingOffsetBytes)
-            .ToList();
+        return result.OrderBy(p => p.StartingOffsetBytes).ToList();
     }
 
     private static string GetExpectedDiskPartType(PartitionInfo partition)
@@ -693,22 +752,47 @@ public class DiskClonerEngine
 
     private static long ParseSizeToBytes(string valueText, string unitText)
     {
+        if (TryParseSizeToBytes(valueText, unitText, out var bytes))
+            return bytes;
+
+        throw new FormatException($"Could not parse size '{valueText} {unitText}' from diskpart output.");
+    }
+
+    private static bool TryParseSizeToBytes(string valueText, string unitText, out long bytes)
+    {
+        bytes = 0;
+        if (string.IsNullOrWhiteSpace(valueText))
+            return false;
+
         var normalizedValue = valueText.Replace(',', '.');
         if (!double.TryParse(normalizedValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
-        {
-            throw new FormatException($"Could not parse size '{valueText} {unitText}' from diskpart output.");
-        }
+            return false;
 
-        double multiplier = unitText.ToUpperInvariant() switch
+        var unit = (unitText ?? string.Empty).Trim();
+        double multiplier = unit.ToUpperInvariant() switch
         {
+            "B" => 1d,
+            "BYTES" => 1d,
             "KB" => 1024d,
             "MB" => 1024d * 1024d,
             "GB" => 1024d * 1024d * 1024d,
             "TB" => 1024d * 1024d * 1024d * 1024d,
-            _ => throw new FormatException($"Unsupported unit '{unitText}' in diskpart output.")
+            "" => 1d,
+            _ => 0d
         };
 
-        return checked((long)Math.Round(value * multiplier, MidpointRounding.AwayFromZero));
+        if (multiplier <= 0d)
+            return false;
+
+        try
+        {
+            bytes = checked((long)Math.Round(value * multiplier, MidpointRounding.AwayFromZero));
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private long GetRequiredTargetStartingOffset(PartitionInfo partition)
