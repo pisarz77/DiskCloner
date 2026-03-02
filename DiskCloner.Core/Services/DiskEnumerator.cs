@@ -22,7 +22,7 @@ public class DiskEnumerator
     private int _systemDiskNumber = -1;
     private bool _isInitialized = false;
 
-    public DiskEnumerator(ILogger logger)
+    public DiskEnumerator(ILogger? logger)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
     }
@@ -370,27 +370,24 @@ public class DiskEnumerator
                     if (!hVolume.IsInvalid)
                     {
                         var size = Marshal.SizeOf<WindowsApi.VOLUME_DISK_EXTENTS>();
-                        IntPtr buffer = Marshal.AllocHGlobal(size);
-                        try
+                        using var buffer = new NativeBuffer(size);
+
+                        uint bytesReturned;
+                        if (WindowsApi.DeviceIoControl(
+                            hVolume,
+                            WindowsApi.IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
+                            IntPtr.Zero, 0,
+                            buffer.Pointer, size,
+                            out bytesReturned,
+                            IntPtr.Zero))
                         {
-                            uint bytesReturned;
-                            if (WindowsApi.DeviceIoControl(
-                                hVolume,
-                                WindowsApi.IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS,
-                                IntPtr.Zero, 0,
-                                buffer, size,
-                                out bytesReturned,
-                                IntPtr.Zero))
+                            var extents = Marshal.PtrToStructure<WindowsApi.VOLUME_DISK_EXTENTS>(buffer.Pointer);
+                            if (extents.NumberOfDiskExtents > 0)
                             {
-                                var extents = Marshal.PtrToStructure<WindowsApi.VOLUME_DISK_EXTENTS>(buffer);
-                                if (extents.NumberOfDiskExtents > 0)
-                                {
-                                    _systemPartitionOffset = extents.Extents[0].StartingOffset;
-                                    _systemDiskNumber = (int)extents.Extents[0].DiskNumber;
-                                }
+                                _systemPartitionOffset = extents.Extents[0].StartingOffset;
+                                _systemDiskNumber = (int)extents.Extents[0].DiskNumber;
                             }
                         }
-                        finally { Marshal.FreeHGlobal(buffer); }
                     }
                 }
                 catch (Exception ex)
@@ -579,21 +576,15 @@ public class DiskEnumerator
                 return false;
 
             const int outSize = 4096;
-            var outBuffer = Marshal.AllocHGlobal(outSize);
-            try
+            using var outBuffer = new NativeBuffer(outSize);
+
+            if (WindowsApi.DeviceIoControl(handle, WindowsApi.IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IntPtr.Zero, 0, outBuffer.Pointer, outSize, out uint bytesReturned, IntPtr.Zero))
             {
-                if (WindowsApi.DeviceIoControl(handle, WindowsApi.IOCTL_DISK_GET_DRIVE_LAYOUT_EX, IntPtr.Zero, 0, outBuffer, outSize, out uint bytesReturned, IntPtr.Zero))
-                {
-                    // DRIVE_LAYOUT_INFORMATION_EX.PartitionStyle is the first int
-                    var partitionStyle = Marshal.ReadInt32(outBuffer);
-                    // 0 = MBR, 1 = GPT
-                    isGpt = partitionStyle == 1;
-                    return true;
-                }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(outBuffer);
+                // DRIVE_LAYOUT_INFORMATION_EX.PartitionStyle is the first int
+                var partitionStyle = Marshal.ReadInt32(outBuffer.Pointer);
+                // 0 = MBR, 1 = GPT
+                isGpt = partitionStyle == 1;
+                return true;
             }
         }
         catch
@@ -738,31 +729,24 @@ public class DiskEnumerator
 
                 // Try to get geometry
                 var size = Marshal.SizeOf<WindowsApi.DISK_GEOMETRY>();
-                var buffer = Marshal.AllocHGlobal(size);
+                using var buffer = new NativeBuffer(size);
 
-                try
-                {
-                    uint bytesReturned;
-                    bool result = WindowsApi.DeviceIoControl(
-                        handle,
-                        WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
-                        IntPtr.Zero,
-                        0,
-                        buffer,
-                        size,
-                        out bytesReturned,
-                        IntPtr.Zero);
+                uint bytesReturned;
+                bool result = WindowsApi.DeviceIoControl(
+                    handle,
+                    WindowsApi.IOCTL_DISK_GET_DRIVE_GEOMETRY,
+                    IntPtr.Zero,
+                    0,
+                    buffer.Pointer,
+                    size,
+                    out bytesReturned,
+                    IntPtr.Zero);
 
-                    if (!result)
-                    {
-                        var error = WindowsApi.GetLastError();
-                        _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
-                        return false;
-                    }
-                }
-                finally
+                if (!result)
                 {
-                    Marshal.FreeHGlobal(buffer);
+                    var error = WindowsApi.GetLastError();
+                    _logger.Error($"Failed to get disk geometry: {WindowsApi.GetErrorMessage(error)}");
+                    return false;
                 }
 
                 return true;

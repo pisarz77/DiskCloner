@@ -16,11 +16,13 @@ public class PartitionInfoTests
         Assert.Equal(0, partition.PartitionNumber);
         Assert.Equal(0, partition.StartingOffset);
         Assert.Equal(0, partition.SizeBytes);
+        Assert.Equal(0, partition.TargetStartingOffset);
+        Assert.Equal(0, partition.TargetPartitionNumber);
         Assert.Null(partition.PartitionTypeGuid);
         Assert.Null(partition.UniqueId);
         Assert.Null(partition.MbrPartitionType);
         Assert.False(partition.IsActive);
-        Assert.Equal(0, partition.GptAttributes);
+        Assert.Equal(0UL, partition.GptAttributes);
         Assert.Equal(string.Empty, partition.PartitionName);
         Assert.Null(partition.DriveLetter);
         Assert.Null(partition.VolumeGuid);
@@ -43,6 +45,8 @@ public class PartitionInfoTests
             PartitionNumber = 1,
             StartingOffset = 1048576,
             SizeBytes = 1000000000,
+            TargetStartingOffset = 2097152,
+            TargetPartitionNumber = 3,
             PartitionTypeGuid = Guid.Parse("C12A7328-F81F-11D2-BA4B-00A0C93EC93B"),
             UniqueId = Guid.NewGuid(),
             MbrPartitionType = 0x07,
@@ -63,9 +67,11 @@ public class PartitionInfoTests
         Assert.Equal(1, partition.PartitionNumber);
         Assert.Equal(1048576, partition.StartingOffset);
         Assert.Equal(1000000000, partition.SizeBytes);
+        Assert.Equal(2097152, partition.TargetStartingOffset);
+        Assert.Equal(3, partition.TargetPartitionNumber);
         Assert.NotNull(partition.PartitionTypeGuid);
         Assert.NotNull(partition.UniqueId);
-        Assert.Equal(0x07, partition.MbrPartitionType);
+        Assert.Equal((byte?)0x07, partition.MbrPartitionType);
         Assert.True(partition.IsActive);
         Assert.Equal(0x8000000000000001, partition.GptAttributes);
         Assert.Equal("EFI System", partition.PartitionName);

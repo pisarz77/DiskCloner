@@ -15,7 +15,9 @@ public class Program
     private static int _passedTests = 0;
     private static int _failedTests = 0;
 
-    public static async Task Main(string[] args)
+    // The explicit test runner entry point was removed to avoid conflict with
+    // auto-generated test runners when running `dotnet test`.
+    public static async Task RunAllTestsAsync()
     {
         Console.WriteLine("Disk Cloner Test Suite");
         Console.WriteLine("======================");
@@ -50,10 +52,10 @@ public class Program
 
         // Test 1: Default constructor
         var disk = new DiskInfo();
-        Assert(disk.DiskNumber == 0, "Default constructor sets DiskNumber to 0");
-        Assert(disk.FriendlyName == string.Empty, "Default constructor sets FriendlyName to empty string");
-        Assert(disk.Partitions != null, "Default constructor initializes Partitions collection");
-        Assert(disk.Partitions.Count == 0, "Default constructor creates empty Partitions collection");
+        RunnerAssert(disk.DiskNumber == 0, "Default constructor sets DiskNumber to 0");
+        RunnerAssert(disk.FriendlyName == string.Empty, "Default constructor sets FriendlyName to empty string");
+        RunnerAssert(disk.Partitions != null, "Default constructor initializes Partitions collection");
+        RunnerAssert(disk.Partitions.Count == 0, "Default constructor creates empty Partitions collection");
 
         // Test 2: Property setting
         disk.DiskNumber = 1;
@@ -62,16 +64,16 @@ public class Program
         disk.IsGpt = true;
         disk.IsSystemDisk = true;
 
-        Assert(disk.DiskNumber == 1, "DiskNumber property works");
-        Assert(disk.FriendlyName == "Test Disk", "FriendlyName property works");
-        Assert(disk.SizeBytes == 1000000000, "SizeBytes property works");
-        Assert(disk.IsGpt == true, "IsGpt property works");
-        Assert(disk.IsSystemDisk == true, "IsSystemDisk property works");
+        RunnerAssert(disk.DiskNumber == 1, "DiskNumber property works");
+        RunnerAssert(disk.FriendlyName == "Test Disk", "FriendlyName property works");
+        RunnerAssert(disk.SizeBytes == 1000000000, "SizeBytes property works");
+        RunnerAssert(disk.IsGpt == true, "IsGpt property works");
+        RunnerAssert(disk.IsSystemDisk == true, "IsSystemDisk property works");
 
         // Test 3: ToString method
         var toString = disk.ToString();
-        Assert(toString.Contains("Disk 1"), "ToString includes disk number");
-        Assert(toString.Contains("Test Disk"), "ToString includes friendly name");
+        RunnerAssert(toString.Contains("Disk 1"), "ToString includes disk number");
+        RunnerAssert(toString.Contains("Test Disk"), "ToString includes friendly name");
 
         Console.WriteLine("✓ DiskInfo tests passed");
     }
@@ -82,10 +84,10 @@ public class Program
 
         // Test 1: Default constructor
         var partition = new PartitionInfo();
-        Assert(partition.PartitionNumber == 0, "Default constructor sets PartitionNumber to 0");
-        Assert(partition.StartingOffset == 0, "Default constructor sets StartingOffset to 0");
-        Assert(partition.SizeBytes == 0, "Default constructor sets SizeBytes to 0");
-        Assert(partition.PartitionName == string.Empty, "Default constructor sets PartitionName to empty string");
+        RunnerAssert(partition.PartitionNumber == 0, "Default constructor sets PartitionNumber to 0");
+        RunnerAssert(partition.StartingOffset == 0, "Default constructor sets StartingOffset to 0");
+        RunnerAssert(partition.SizeBytes == 0, "Default constructor sets SizeBytes to 0");
+        RunnerAssert(partition.PartitionName == string.Empty, "Default constructor sets PartitionName to empty string");
 
         // Test 2: Property setting
         partition.PartitionNumber = 1;
@@ -95,24 +97,24 @@ public class Program
         partition.IsSystemPartition = true;
         partition.IsEfiPartition = false;
 
-        Assert(partition.PartitionNumber == 1, "PartitionNumber property works");
-        Assert(partition.StartingOffset == 1048576, "StartingOffset property works");
-        Assert(partition.SizeBytes == 1000000000, "SizeBytes property works");
-        Assert(partition.DriveLetter == 'C', "DriveLetter property works");
-        Assert(partition.IsSystemPartition == true, "IsSystemPartition property works");
-        Assert(partition.IsEfiPartition == false, "IsEfiPartition property works");
+        RunnerAssert(partition.PartitionNumber == 1, "PartitionNumber property works");
+        RunnerAssert(partition.StartingOffset == 1048576, "StartingOffset property works");
+        RunnerAssert(partition.SizeBytes == 1000000000, "SizeBytes property works");
+        RunnerAssert(partition.DriveLetter == 'C', "DriveLetter property works");
+        RunnerAssert(partition.IsSystemPartition == true, "IsSystemPartition property works");
+        RunnerAssert(partition.IsEfiPartition == false, "IsEfiPartition property works");
 
         // Test 3: Calculated properties
-        Assert(partition.StartingSector == 2048, "StartingSector calculation works");
-        Assert(partition.Sectors == 1953125, "Sectors calculation works");
+        RunnerAssert(partition.StartingSector == 2048, "StartingSector calculation works");
+        RunnerAssert(partition.Sectors == 1953125, "Sectors calculation works");
 
         // Test 4: IsBootRequired property
-        Assert(partition.IsBootRequired == true, "IsBootRequired returns true for system partition");
+        RunnerAssert(partition.IsBootRequired == true, "IsBootRequired returns true for system partition");
 
         // Test 5: ToString method
         var toString = partition.ToString();
-        Assert(toString.Contains("Partition 1"), "ToString includes partition number");
-        Assert(toString.Contains("Drive C:"), "ToString includes drive letter");
+        RunnerAssert(toString.Contains("Partition 1"), "ToString includes partition number");
+        RunnerAssert(toString.Contains("Drive C:"), "ToString includes drive letter");
 
         Console.WriteLine("✓ PartitionInfo tests passed");
     }
@@ -123,12 +125,14 @@ public class Program
 
         // Test 1: Default constructor
         var operation = new CloneOperation();
-        Assert(operation.PartitionsToClone != null, "Default constructor initializes PartitionsToClone");
-        Assert(operation.PartitionsToClone.Count == 0, "Default constructor creates empty PartitionsToClone");
-        Assert(operation.UseVss == true, "Default constructor sets UseVss to true");
-        Assert(operation.IoBufferSize == 64 * 1024 * 1024, "Default constructor sets IoBufferSize to 64MB");
-        Assert(operation.VerifyIntegrity == true, "Default constructor sets VerifyIntegrity to true");
-        Assert(operation.OperationId != Guid.Empty, "Default constructor generates OperationId");
+        RunnerAssert(operation.PartitionsToClone != null, "Default constructor initializes PartitionsToClone");
+        RunnerAssert(operation.PartitionsToClone.Count == 0, "Default constructor creates empty PartitionsToClone");
+        RunnerAssert(operation.UseVss == true, "Default constructor sets UseVss to true");
+        RunnerAssert(operation.IoBufferSize == 64 * 1024 * 1024, "Default constructor sets IoBufferSize to 64MB");
+        RunnerAssert(operation.VerifyIntegrity == true, "Default constructor sets VerifyIntegrity to true");
+        RunnerAssert(operation.StrictVerificationFailureStopsClone == true, "Default constructor sets StrictVerificationFailureStopsClone to true");
+        RunnerAssert(operation.UseSnapshotForFileMigration == true, "Default constructor sets UseSnapshotForFileMigration to true");
+        RunnerAssert(operation.OperationId != Guid.Empty, "Default constructor generates OperationId");
 
         // Test 2: Property setting
         var sourceDisk = new DiskInfo { DiskNumber = 0 };
@@ -145,12 +149,12 @@ public class Program
         operation.IoBufferSize = 32 * 1024 * 1024;
         operation.VerifyIntegrity = false;
 
-        Assert(operation.SourceDisk == sourceDisk, "SourceDisk property works");
-        Assert(operation.TargetDisk == targetDisk, "TargetDisk property works");
-        Assert(operation.PartitionsToClone == partitions, "PartitionsToClone property works");
-        Assert(operation.UseVss == false, "UseVss property works");
-        Assert(operation.IoBufferSize == 32 * 1024 * 1024, "IoBufferSize property works");
-        Assert(operation.VerifyIntegrity == false, "VerifyIntegrity property works");
+        RunnerAssert(operation.SourceDisk == sourceDisk, "SourceDisk property works");
+        RunnerAssert(operation.TargetDisk == targetDisk, "TargetDisk property works");
+        RunnerAssert(operation.PartitionsToClone == partitions, "PartitionsToClone property works");
+        RunnerAssert(operation.UseVss == false, "UseVss property works");
+        RunnerAssert(operation.IoBufferSize == 32 * 1024 * 1024, "IoBufferSize property works");
+        RunnerAssert(operation.VerifyIntegrity == false, "VerifyIntegrity property works");
 
         Console.WriteLine("✓ CloneOperation tests passed");
     }
@@ -166,34 +170,34 @@ public class Program
         {
             // Test 1: Get disks
             var disks = await enumerator.GetDisksAsync();
-            Assert(disks != null, "GetDisksAsync returns non-null result");
-            Assert(disks.Count > 0, "GetDisksAsync returns at least one disk");
+            RunnerAssert(disks != null, "GetDisksAsync returns non-null result");
+            RunnerAssert(disks.Count > 0, "GetDisksAsync returns at least one disk");
 
             // Test 2: Get system disk
             var systemDisk = await enumerator.GetSystemDiskAsync();
-            Assert(systemDisk != null, "GetSystemDiskAsync returns non-null result");
-            Assert(systemDisk.IsSystemDisk, "GetSystemDiskAsync returns system disk");
+            RunnerAssert(systemDisk != null, "GetSystemDiskAsync returns non-null result");
+            RunnerAssert(systemDisk.IsSystemDisk, "GetSystemDiskAsync returns system disk");
 
             // Test 3: Get target disks
             var targetDisks = await enumerator.GetTargetDisksAsync();
-            Assert(targetDisks != null, "GetTargetDisksAsync returns non-null result");
-            Assert(targetDisks.Count >= 0, "GetTargetDisksAsync returns valid count");
+            RunnerAssert(targetDisks != null, "GetTargetDisksAsync returns non-null result");
+            RunnerAssert(targetDisks.Count >= 0, "GetTargetDisksAsync returns valid count");
 
             // Test 4: Disk properties
             var disk = disks[0];
-            Assert(disk.DiskNumber >= 0, "Disk number is valid");
-            Assert(!string.IsNullOrEmpty(disk.FriendlyName), "Disk friendly name is not empty");
-            Assert(disk.SizeBytes >= 0, "Disk size is valid");
-            Assert(disk.Partitions != null, "Disk partitions collection is not null");
+            RunnerAssert(disk.DiskNumber >= 0, "Disk number is valid");
+            RunnerAssert(!string.IsNullOrEmpty(disk.FriendlyName), "Disk friendly name is not empty");
+            RunnerAssert(disk.SizeBytes >= 0, "Disk size is valid");
+            RunnerAssert(disk.Partitions != null, "Disk partitions collection is not null");
 
             // Test 5: Partition properties
-            if (disk.Partitions.Count > 0)
-            {
-                var partition = disk.Partitions[0];
-                Assert(partition.PartitionNumber > 0, "Partition number is valid");
-                Assert(partition.SizeBytes > 0, "Partition size is valid");
-                Assert(partition.GetTypeName() != null, "Partition type name is not null");
-            }
+                if (disk.Partitions.Count > 0)
+                {
+                    var partition = disk.Partitions[0];
+                    RunnerAssert(partition.PartitionNumber > 0, "Partition number is valid");
+                    RunnerAssert(partition.SizeBytes > 0, "Partition size is valid");
+                    RunnerAssert(partition.GetTypeName() != null, "Partition type name is not null");
+                }
 
             Console.WriteLine("✓ DiskEnumerator tests passed");
         }
@@ -215,13 +219,13 @@ public class Program
         {
             // Test 1: Check VSS availability
             var isVssAvailable = await vssService.IsVssAvailableAsync();
-            Assert(isVssAvailable is bool, "IsVssAvailableAsync returns boolean");
+            RunnerAssert(isVssAvailable is bool, "IsVssAvailableAsync returns boolean");
 
             // Test 2: Get BitLocker status
             var bitLockerStatus = await vssService.GetBitLockerStatusAsync();
-            Assert(bitLockerStatus != null, "GetBitLockerStatusAsync returns non-null result");
-            Assert(bitLockerStatus.Status != null, "BitLocker status is not null");
-            Assert(bitLockerStatus.Protectors != null, "BitLocker protectors is not null");
+            RunnerAssert(bitLockerStatus != null, "GetBitLockerStatusAsync returns non-null result");
+            RunnerAssert(bitLockerStatus.Status != null, "BitLocker status is not null");
+            RunnerAssert(bitLockerStatus.Protectors != null, "BitLocker protectors is not null");
 
             Console.WriteLine("✓ VssSnapshotService tests passed");
         }
@@ -246,29 +250,29 @@ public class Program
             // Test 1: Info logging
             logger.Info("Test info message");
             var content = File.ReadAllText(tempFile);
-            Assert(content.Contains("INFO"), "Info message contains INFO level");
-            Assert(content.Contains("Test info message"), "Info message contains the message");
+            RunnerAssert(content.Contains("INFO"), "Info message contains INFO level");
+            RunnerAssert(content.Contains("Test info message"), "Info message contains the message");
 
             // Test 2: Warning logging
             logger.Warning("Test warning message");
             content = File.ReadAllText(tempFile);
-            Assert(content.Contains("WARNING"), "Warning message contains WARNING level");
+            RunnerAssert(content.Contains("WARNING"), "Warning message contains WARNING level");
 
             // Test 3: Error logging
             logger.Error("Test error message");
             content = File.ReadAllText(tempFile);
-            Assert(content.Contains("ERROR"), "Error message contains ERROR level");
+            RunnerAssert(content.Contains("ERROR"), "Error message contains ERROR level");
 
             // Test 4: Error with exception
             var exception = new Exception("Test exception");
             logger.Error("Test error with exception", exception);
             content = File.ReadAllText(tempFile);
-            Assert(content.Contains("Test exception"), "Error with exception contains exception message");
+            RunnerAssert(content.Contains("Test exception"), "Error with exception contains exception message");
 
             // Test 5: Debug logging
             logger.Debug("Test debug message");
             content = File.ReadAllText(tempFile);
-            Assert(content.Contains("DEBUG"), "Debug message contains DEBUG level");
+            RunnerAssert(content.Contains("DEBUG"), "Debug message contains DEBUG level");
 
             Console.WriteLine("✓ FileLogger tests passed");
         }
@@ -293,21 +297,21 @@ public class Program
         {
             // Test 1: Full workflow - get system disk and its partitions
             var systemDisk = await enumerator.GetSystemDiskAsync();
-            Assert(systemDisk != null, "System disk is found");
-            Assert(systemDisk.IsSystemDisk, "System disk is marked as system");
-            Assert(systemDisk.Partitions.Count > 0, "System disk has partitions");
+            RunnerAssert(systemDisk != null, "System disk is found");
+            RunnerAssert(systemDisk.IsSystemDisk, "System disk is marked as system");
+            RunnerAssert(systemDisk.Partitions.Count > 0, "System disk has partitions");
 
             // Test 2: Check for system partition
             var systemPartition = systemDisk.Partitions.FirstOrDefault(p => p.IsSystemPartition);
-            Assert(systemPartition != null, "System partition is found");
+            RunnerAssert(systemPartition != null, "System partition is found");
 
             // Test 3: Check VSS availability
             var isVssAvailable = await vssService.IsVssAvailableAsync();
-            Assert(isVssAvailable, "VSS is available");
+            RunnerAssert(isVssAvailable, "VSS is available");
 
             // Test 4: Check BitLocker status
             var bitLockerStatus = await vssService.GetBitLockerStatusAsync();
-            Assert(bitLockerStatus != null, "BitLocker status is retrieved");
+            RunnerAssert(bitLockerStatus != null, "BitLocker status is retrieved");
 
             Console.WriteLine("✓ Integration tests passed");
         }
@@ -318,7 +322,7 @@ public class Program
         }
     }
 
-    private static void Assert(bool condition, string message)
+    private static void RunnerAssert(bool condition, string message)
     {
         if (condition)
         {

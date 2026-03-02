@@ -18,7 +18,7 @@ public class VssSnapshotService : IDisposable
     private Guid _snapshotSetId = Guid.Empty;
     private bool _disposed;
 
-    public VssSnapshotService(ILogger logger)
+    public VssSnapshotService(ILogger? logger)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         _logger.Info("VSS Snapshot Service initialized (Native AlphaVSS)");
@@ -130,7 +130,7 @@ public class VssSnapshotService : IDisposable
     /// <summary>
     /// Adapter: create snapshots for the given CloneOperation (test-friendly API).
     /// </summary>
-    public async Task<SnapshotInfo> CreateSnapshotsAsync(CloneOperation operation)
+    public async Task<SnapshotInfo> CreateSnapshotsAsync(CloneOperation? operation)
     {
         if (operation == null)
             throw new ArgumentNullException(nameof(operation));
@@ -180,7 +180,7 @@ public class VssSnapshotService : IDisposable
     /// <summary>
     /// Adapter: cleanup snapshots created by CreateSnapshotsAsync(CloneOperation).
     /// </summary>
-    public async Task CleanupSnapshotsAsync(SnapshotInfo snapshotInfo)
+    public async Task CleanupSnapshotsAsync(SnapshotInfo? snapshotInfo)
     {
         if (snapshotInfo == null)
             throw new ArgumentNullException(nameof(snapshotInfo));

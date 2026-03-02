@@ -34,6 +34,11 @@ public class PartitionInfo
     public long TargetStartingOffset { get; set; }
 
     /// <summary>
+    /// The target partition number after partition table creation.
+    /// </summary>
+    public int TargetPartitionNumber { get; set; }
+
+    /// <summary>
     /// For GPT: The partition type GUID.
     /// </summary>
     public Guid? PartitionTypeGuid { get; set; }
@@ -56,7 +61,7 @@ public class PartitionInfo
     /// <summary>
     /// For GPT: Partition attributes flags.
     /// </summary>
-    public long GptAttributes { get; set; }
+    public ulong GptAttributes { get; set; }
 
     /// <summary>
     /// For GPT: Partition name (up to 36 UTF-16 characters).

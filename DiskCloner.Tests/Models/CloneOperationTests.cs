@@ -21,6 +21,8 @@ public class CloneOperationTests
         Assert.False(operation.FullHashVerification);
         Assert.True(operation.AutoExpandWindowsPartition);
         Assert.False(operation.AllowSmallerTarget);
+        Assert.True(operation.StrictVerificationFailureStopsClone);
+        Assert.True(operation.UseSnapshotForFileMigration);
         Assert.Equal(string.Empty, operation.LogFilePath);
         Assert.NotEqual(Guid.Empty, operation.OperationId);
     }
@@ -49,6 +51,8 @@ public class CloneOperationTests
             FullHashVerification = true,
             AutoExpandWindowsPartition = false,
             AllowSmallerTarget = true,
+            StrictVerificationFailureStopsClone = false,
+            UseSnapshotForFileMigration = false,
             LogFilePath = @"C:\logs\clone.log"
         };
 
@@ -62,6 +66,8 @@ public class CloneOperationTests
         Assert.True(operation.FullHashVerification);
         Assert.False(operation.AutoExpandWindowsPartition);
         Assert.True(operation.AllowSmallerTarget);
+        Assert.False(operation.StrictVerificationFailureStopsClone);
+        Assert.False(operation.UseSnapshotForFileMigration);
         Assert.Equal(@"C:\logs\clone.log", operation.LogFilePath);
     }
 
@@ -214,7 +220,9 @@ public class CloneResultTests
         Assert.False(result.IntegrityVerified);
         Assert.False(result.TargetMarkedIncomplete);
         Assert.NotNull(result.NextSteps);
+        Assert.NotNull(result.Warnings);
         Assert.Empty(result.NextSteps);
+        Assert.Empty(result.Warnings);
     }
 
     [Fact]
@@ -241,7 +249,8 @@ public class CloneResultTests
                 "Shutdown computer",
                 "Swap drives",
                 "Boot from new drive"
-            }
+            },
+            Warnings = new List<string> { "test warning" }
         };
 
         // Assert
@@ -256,6 +265,7 @@ public class CloneResultTests
         Assert.True(result.IntegrityVerified);
         Assert.False(result.TargetMarkedIncomplete);
         Assert.Equal(3, result.NextSteps.Count);
+        Assert.Single(result.Warnings);
         Assert.Contains("Shutdown computer", result.NextSteps);
         Assert.Contains("Swap drives", result.NextSteps);
         Assert.Contains("Boot from new drive", result.NextSteps);

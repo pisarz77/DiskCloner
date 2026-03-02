@@ -82,7 +82,6 @@ public class DiskEnumeratorTests
 
         if (targetDisk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -149,7 +148,6 @@ public class DiskEnumeratorTests
 
         if (targetDisk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -179,7 +177,6 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -204,8 +201,7 @@ public class DiskEnumeratorTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No partitions available for testing");
         }
 
         var partition = disk.Partitions.First();
@@ -244,7 +240,6 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -263,7 +258,6 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -280,8 +274,7 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No disks available for testing");
         }
 
         // Assert
@@ -297,8 +290,7 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No disks available for testing");
         }
 
         // Assert
@@ -314,8 +306,7 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No disks available for testing");
         }
 
         // Assert
@@ -331,7 +322,6 @@ public class DiskEnumeratorTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
             return;
         }
 
@@ -348,8 +338,7 @@ public class DiskEnumeratorTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No partitions available for testing");
         }
 
         // Assert
@@ -375,8 +364,7 @@ public class DiskEnumeratorTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
-            return;
+            throw new Xunit.Sdk.SkipTestException("No partitions available for testing");
         }
 
         // Assert
@@ -402,7 +390,6 @@ public class DiskEnumeratorTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -426,7 +413,6 @@ public class DiskEnumeratorTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
             return;
         }
 

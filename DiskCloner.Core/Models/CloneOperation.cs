@@ -58,6 +58,16 @@ public class CloneOperation
     public bool SmartCopy { get; set; } = false;
 
     /// <summary>
+    /// Whether verification mismatch should fail the clone operation.
+    /// </summary>
+    public bool StrictVerificationFailureStopsClone { get; set; } = true;
+
+    /// <summary>
+    /// Whether file-system migration for smaller target should read from VSS snapshots.
+    /// </summary>
+    public bool UseSnapshotForFileMigration { get; set; } = true;
+
+    /// <summary>
     /// Path to the log file.
     /// </summary>
     public string LogFilePath { get; set; } = string.Empty;
@@ -284,4 +294,9 @@ public class CloneResult
     /// Recommended next steps for the user.
     /// </summary>
     public List<string> NextSteps { get; set; } = new();
+
+    /// <summary>
+    /// Non-fatal warnings encountered during the operation.
+    /// </summary>
+    public List<string> Warnings { get; set; } = new();
 }

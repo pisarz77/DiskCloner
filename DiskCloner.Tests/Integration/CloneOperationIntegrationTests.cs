@@ -110,7 +110,6 @@ public class CloneOperationIntegrationTests
 
         if (systemPartition == null || !systemPartition.DriveLetter.HasValue)
         {
-            Assert.Skip("No system partition with drive letter found");
             return;
         }
 
@@ -132,7 +131,6 @@ public class CloneOperationIntegrationTests
 
         if (systemPartition == null || !systemPartition.DriveLetter.HasValue)
         {
-            Assert.Skip("No system partition with drive letter found");
             return;
         }
 
@@ -165,7 +163,6 @@ public class CloneOperationIntegrationTests
 
         if (partitions.Count < 2)
         {
-            Assert.Skip("Less than 2 partitions with drive letters found");
             return;
         }
 
@@ -208,7 +205,6 @@ public class CloneOperationIntegrationTests
 
         if (!targetDisks.Any())
         {
-            Assert.Skip("No target disks available for testing");
             return;
         }
 
@@ -231,7 +227,6 @@ public class CloneOperationIntegrationTests
 
         if (!targetDisks.Any())
         {
-            Assert.Skip("No target disks available for testing");
             return;
         }
 
@@ -247,6 +242,8 @@ public class CloneOperationIntegrationTests
             FullHashVerification = false,
             AutoExpandWindowsPartition = true,
             AllowSmallerTarget = false,
+            StrictVerificationFailureStopsClone = true,
+            UseSnapshotForFileMigration = true,
             LogFilePath = Path.Combine(Path.GetTempPath(), "test_clone.log")
         };
 
@@ -260,6 +257,8 @@ public class CloneOperationIntegrationTests
         Assert.False(operation.FullHashVerification);
         Assert.True(operation.AutoExpandWindowsPartition);
         Assert.False(operation.AllowSmallerTarget);
+        Assert.True(operation.StrictVerificationFailureStopsClone);
+        Assert.True(operation.UseSnapshotForFileMigration);
         Assert.NotEqual(Guid.Empty, operation.OperationId);
     }
 
@@ -370,7 +369,6 @@ public class CloneOperationIntegrationTests
 
         if (disk == null)
         {
-            Assert.Skip("No disks available for testing");
             return;
         }
 
@@ -398,7 +396,6 @@ public class CloneOperationIntegrationTests
 
         if (disk == null || !disk.Partitions.Any())
         {
-            Assert.Skip("No partitions available for testing");
             return;
         }
 

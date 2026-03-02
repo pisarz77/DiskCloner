@@ -41,7 +41,7 @@ public class VssSnapshotServiceTests
     public async void CreateSnapshotsAsync_ThrowsOnNullOperation()
     {
         // Act & Assert
-        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CreateSnapshotsAsync(null));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CreateSnapshotsAsync((CloneOperation)null));
     }
 
     [Fact]
@@ -160,7 +160,7 @@ public class VssSnapshotServiceTests
     public async void CleanupSnapshotsAsync_ThrowsOnNullSnapshotInfo()
     {
         // Act & Assert
-        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CleanupSnapshotsAsync(null));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CleanupSnapshotsAsync((VssSnapshotService.SnapshotInfo)null));
     }
 
     [Fact]

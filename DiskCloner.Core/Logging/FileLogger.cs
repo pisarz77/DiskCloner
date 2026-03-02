@@ -15,9 +15,12 @@ public class FileLogger : ILogger
     private StreamWriter? _writer;
     private bool _disposed;
 
-    public FileLogger(string logFilePath, LogLevel minLevel = LogLevel.Debug)
+    public FileLogger(string? logFilePath, LogLevel minLevel = LogLevel.Debug)
     {
-        _logFilePath = logFilePath;
+        if (string.IsNullOrWhiteSpace(logFilePath))
+            throw new ArgumentNullException(nameof(logFilePath));
+
+        _logFilePath = logFilePath!;
         _minLevel = minLevel;
 
         var directory = Path.GetDirectoryName(logFilePath);
@@ -34,32 +37,32 @@ public class FileLogger : ILogger
         Info($"Logger initialized. Log file: {logFilePath}");
     }
 
-    public void Debug(string message)
+    public void Debug(string? message)
     {
         Log(LogLevel.Debug, message);
     }
 
-    public void Info(string message)
+    public void Info(string? message)
     {
         Log(LogLevel.Info, message);
     }
 
-    public void Warning(string message)
+    public void Warning(string? message)
     {
         Log(LogLevel.Warning, message);
     }
 
-    public void Error(string message)
+    public void Error(string? message)
     {
         Log(LogLevel.Error, message);
     }
 
-    public void Error(string message, Exception ex)
+    public void Error(string? message, Exception ex)
     {
         Log(LogLevel.Error, message, ex);
     }
 
-    private void Log(LogLevel level, string message, Exception? exception = null)
+    private void Log(LogLevel level, string? message, Exception? exception = null)
     {
         if (level < _minLevel)
             return;
@@ -68,7 +71,7 @@ public class FileLogger : ILogger
         {
             Timestamp = DateTime.UtcNow,
             Level = level,
-            Message = message,
+            Message = message ?? string.Empty,
             Exception = exception
         };
 
