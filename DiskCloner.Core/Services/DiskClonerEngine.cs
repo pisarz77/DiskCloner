@@ -1,9 +1,11 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
+using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 
 namespace DiskCloner.Core.Services;
 
@@ -13,6 +15,10 @@ namespace DiskCloner.Core.Services;
 /// </summary>
 public class DiskClonerEngine
 {
+    private static readonly Regex DiskPartPartitionLineRegex = new(
+        @"^\s*\*?\s*Partition\s+(?<number>\d+)\s+(?<type>.+?)\s+(?<sizeValue>\d+(?:[.,]\d+)?)\s+(?<sizeUnit>KB|MB|GB|TB)\s+(?<offsetValue>\d+(?:[.,]\d+)?)\s+(?<offsetUnit>KB|MB|GB|TB)\s*$",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
     private readonly ILogger _logger;
     private readonly DiskEnumerator _diskEnumerator;
     private readonly VssSnapshotService _vssService;
@@ -467,6 +473,9 @@ public class DiskClonerEngine
     {
         var scriptPath = Path.GetTempFileName();
         var scriptContent = new StringBuilder();
+        var orderedSourcePartitions = operation.PartitionsToClone
+            .OrderBy(p => p.StartingOffset)
+            .ToList();
 
         scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
         scriptContent.AppendLine("clean");
@@ -483,7 +492,7 @@ public class DiskClonerEngine
         }
 
         // Create partitions matching the source
-        foreach (var partition in operation.PartitionsToClone.OrderBy(p => p.StartingOffset))
+        foreach (var partition in orderedSourcePartitions)
         {
             var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
             
@@ -547,6 +556,7 @@ public class DiskClonerEngine
                 }
                 else
                 {
+                    ApplyTargetPartitionOffsets(operation, output);
                     _logger.Info("Partitions created successfully");
                 }
             }
@@ -561,6 +571,114 @@ public class DiskClonerEngine
         }
     }
 
+    private void ApplyTargetPartitionOffsets(CloneOperation operation, string diskPartOutput)
+    {
+        var sourcePartitions = operation.PartitionsToClone
+            .OrderBy(p => p.StartingOffset)
+            .ToList();
+        var targetPartitions = ParsePartitionTableFromDiskPartOutput(diskPartOutput);
+
+        if (targetPartitions.Count < sourcePartitions.Count)
+        {
+            throw new InvalidOperationException(
+                $"Partition mapping failed: expected at least {sourcePartitions.Count} target partitions, " +
+                $"but diskpart listed {targetPartitions.Count}. Aborting to avoid incorrect writes.");
+        }
+
+        if (targetPartitions.Count > sourcePartitions.Count)
+        {
+            _logger.Warning(
+                $"diskpart listed {targetPartitions.Count} partitions but only {sourcePartitions.Count} are scheduled for cloning. " +
+                "Mapping by ascending offset for selected partitions.");
+        }
+
+        for (int i = 0; i < sourcePartitions.Count; i++)
+        {
+            var sourcePartition = sourcePartitions[i];
+            var targetPartition = targetPartitions[i];
+            sourcePartition.TargetStartingOffset = targetPartition.StartingOffsetBytes;
+
+            _logger.Info(
+                $"Partition mapping: source [{sourcePartition.PartitionNumber}] offset {sourcePartition.StartingOffset} -> " +
+                $"target partition {targetPartition.PartitionNumber} offset {targetPartition.StartingOffsetBytes}");
+        }
+    }
+
+    private static List<(int PartitionNumber, long StartingOffsetBytes)> ParsePartitionTableFromDiskPartOutput(string output)
+    {
+        var result = new List<(int PartitionNumber, long StartingOffsetBytes)>();
+        var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+        foreach (var line in lines)
+        {
+            var match = DiskPartPartitionLineRegex.Match(line);
+            if (!match.Success)
+                continue;
+
+            var partitionNumber = int.Parse(match.Groups["number"].Value, CultureInfo.InvariantCulture);
+            var offsetValue = match.Groups["offsetValue"].Value;
+            var offsetUnit = match.Groups["offsetUnit"].Value;
+            var offsetBytes = ParseSizeToBytes(offsetValue, offsetUnit);
+
+            result.Add((partitionNumber, offsetBytes));
+        }
+
+        return result
+            .OrderBy(p => p.StartingOffsetBytes)
+            .ToList();
+    }
+
+    private static long ParseSizeToBytes(string valueText, string unitText)
+    {
+        var normalizedValue = valueText.Replace(',', '.');
+        if (!double.TryParse(normalizedValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
+        {
+            throw new FormatException($"Could not parse size '{valueText} {unitText}' from diskpart output.");
+        }
+
+        double multiplier = unitText.ToUpperInvariant() switch
+        {
+            "KB" => 1024d,
+            "MB" => 1024d * 1024d,
+            "GB" => 1024d * 1024d * 1024d,
+            "TB" => 1024d * 1024d * 1024d * 1024d,
+            _ => throw new FormatException($"Unsupported unit '{unitText}' in diskpart output.")
+        };
+
+        return checked((long)Math.Round(value * multiplier, MidpointRounding.AwayFromZero));
+    }
+
+    private long GetRequiredTargetStartingOffset(PartitionInfo partition)
+    {
+        if (partition.TargetStartingOffset <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Target partition offset is not initialized for source partition {partition.PartitionNumber}. " +
+                "Aborting to avoid writing data to the wrong location.");
+        }
+
+        return partition.TargetStartingOffset;
+    }
+
+    private async Task<long> FallbackToRawCopyOrThrowAsync(
+        CloneOperation operation,
+        PartitionInfo partition,
+        CloneProgress progress,
+        long totalBytesAlreadyCopied,
+        string reason)
+    {
+        var shrinkingThisPartition = operation.AllowSmallerTarget && partition.TargetSizeBytes < partition.SizeBytes;
+        if (shrinkingThisPartition)
+        {
+            throw new InvalidOperationException(
+                $"{reason}. Smart copy is required when shrinking partitions, but NTFS bitmap could not be read. " +
+                "Retry with Smart Copy enabled and the source volume healthy, or clone to an equal/larger target.");
+        }
+
+        _logger.Warning($"{reason}, falling back to raw copy");
+        return await CopyPartitionAsync(operation, partition, progress, totalBytesAlreadyCopied);
+    }
+
     /// <summary>
     /// Copies a single partition from source to target using native aligned buffers.
     /// Physical disk handles on Windows implicitly use unbuffered I/O, which requires
@@ -572,6 +690,7 @@ public class DiskClonerEngine
 
         var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
+        var targetPartitionOffset = GetRequiredTargetStartingOffset(partition);
 
         var partitionBytesCopied = 0L;
         var totalBytesInPartition = partition.TargetSizeBytes;
@@ -642,7 +761,7 @@ public class DiskClonerEngine
                     bytesToRead = ((bytesToRead + sectorSize - 1) / sectorSize) * sectorSize;
 
                     long absoluteSourceOffset = partition.StartingOffset + relativeOffset;
-                    long absoluteTargetOffset = partition.StartingOffset + relativeOffset; // Assuming 1:1 layout for now
+                    long absoluteTargetOffset = targetPartitionOffset + relativeOffset;
 
                     // Seek to source position
                     if (!WindowsApi.SetFilePointerEx(sourceHandle, absoluteSourceOffset, out _, WindowsApi.FILE_BEGIN))
@@ -732,36 +851,29 @@ public class DiskClonerEngine
 
         var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
+        var sourcePartitionOffset = partition.StartingOffset;
+        var targetPartitionOffset = GetRequiredTargetStartingOffset(partition);
         
-        // Determine the correct volume path (use VSS snapshot if enabled and available)
-        var volumePath = $@"\\.\{partition.DriveLetter!.Value}:";
-        if (operation.UseVss)
-        {
-            var originalVolumePath = $@"{partition.DriveLetter.Value}:\";
-            var snapshotPath = _vssService.GetSnapshotVolumePath(originalVolumePath);
-            if (!string.IsNullOrEmpty(snapshotPath))
-            {
-                // Remove trailing backslash for CreateFile
-                volumePath = snapshotPath.TrimEnd('\\');
-                _logger.Info($"Using VSS snapshot path for bitmap: {volumePath}");
-            }
-        }
-
+        // FSCTL_GET_VOLUME_BITMAP must be routed to the live volume handle, not the VSS snapshot.
+        // VSS snapshots return ERROR_INVALID_FUNCTION (1) for this IOCTL.
+        var bitmapVolumePath = $@"\\.\{partition.DriveLetter!.Value}:";
+        
+        // For the actual data reads, we still use the physical disk (or we could use the VSS snapshot if we mapped cluster offsets to the snapshot, but physical disk + VSS is complex. We will read from the physical disk, which might have slight tearing, but for smart copy that's usually acceptable if VSS flushes first).
+        
         var partitionBytesCopied = 0L;
         const int sectorSize = 512;
 
         var bufferSize = operation.IoBufferSize;
         bufferSize = ((bufferSize + sectorSize - 1) / sectorSize) * sectorSize;
 
-        return await Task.Run(() =>
+        return await Task.Run(async () =>
         {
             // --- Step 1: Read the NTFS bitmap from the volume ---
-            _logger.Info($"Reading NTFS bitmap from volume {volumePath}");
+            _logger.Info($"Reading NTFS bitmap from live volume {bitmapVolumePath}");
 
-            // Note: VSS snapshot volumes might require different access flags.
-            // Try FILE_SHARE_READ | FILE_SHARE_WRITE first, just like raw copy.
+            // Open the live volume (not the VSS snapshot) for reading the bitmap
             using var volumeHandle = WindowsApi.CreateFile(
-                volumePath,
+                bitmapVolumePath,
                 WindowsApi.GENERIC_READ,
                 WindowsApi.FILE_SHARE_READ | WindowsApi.FILE_SHARE_WRITE,
                 IntPtr.Zero,
@@ -769,13 +881,15 @@ public class DiskClonerEngine
                 0,
                 IntPtr.Zero);
 
-
             if (volumeHandle.IsInvalid)
             {
                 var err = Marshal.GetLastWin32Error();
-                _logger.Warning($"Cannot open volume {volumePath} for bitmap read ({err}), falling back to raw copy");
-                // Fall back — call raw copy inline
-                return totalBytesAlreadyCopied; // caller will redo raw
+                return await FallbackToRawCopyOrThrowAsync(
+                    operation,
+                    partition,
+                    progress,
+                    totalBytesAlreadyCopied,
+                    $"Cannot open volume {bitmapVolumePath} for bitmap read ({err})");
             }
 
             // Read NTFS boot sector to get bytes per cluster
@@ -783,8 +897,12 @@ public class DiskClonerEngine
             uint bootRead;
             if (!WindowsApi.ReadFile(volumeHandle, bootSector, 512, out bootRead, IntPtr.Zero) || bootRead < 512)
             {
-                _logger.Warning("Failed to read NTFS boot sector, falling back to raw copy");
-                return totalBytesAlreadyCopied;
+                return await FallbackToRawCopyOrThrowAsync(
+                    operation,
+                    partition,
+                    progress,
+                    totalBytesAlreadyCopied,
+                    "Failed to read NTFS boot sector");
             }
 
             // NTFS boot sector offsets: bytes per sector at 0x0B, sectors per cluster at 0x0D
@@ -794,8 +912,12 @@ public class DiskClonerEngine
 
             if (bytesPerCluster <= 0 || bytesPerCluster > 64 * 1024 * 1024)
             {
-                _logger.Warning($"Unexpected cluster size {bytesPerCluster}, falling back to raw copy");
-                return totalBytesAlreadyCopied;
+                return await FallbackToRawCopyOrThrowAsync(
+                    operation,
+                    partition,
+                    progress,
+                    totalBytesAlreadyCopied,
+                    $"Unexpected NTFS cluster size {bytesPerCluster}");
             }
 
             _logger.Info($"NTFS cluster size: {bytesPerCluster} bytes ({bytesPerCluster / 1024} KB)");
@@ -825,8 +947,12 @@ public class DiskClonerEngine
                 int lastErr = Marshal.GetLastWin32Error();
                 if (!ok && lastErr != 234) // 234 = ERROR_MORE_DATA
                 {
-                    _logger.Warning($"FSCTL_GET_VOLUME_BITMAP failed ({lastErr}), falling back to raw copy");
-                    return totalBytesAlreadyCopied;
+                    return await FallbackToRawCopyOrThrowAsync(
+                        operation,
+                        partition,
+                        progress,
+                        totalBytesAlreadyCopied,
+                        $"FSCTL_GET_VOLUME_BITMAP failed ({lastErr})");
                 }
 
                 // Parse header: StartingLcn (8 bytes) + BitmapSize in clusters (8 bytes)
@@ -968,46 +1094,47 @@ public class DiskClonerEngine
                         if (runBytes >= clusterRoundedBuffer) break;
                     }
 
-                    long runByteOffset = partition.StartingOffset + runStart * bytesPerCluster;
+                    long runSourceByteOffset = sourcePartitionOffset + runStart * bytesPerCluster;
+                    long runTargetByteOffset = targetPartitionOffset + runStart * bytesPerCluster;
                     long runByteLength = (lcn - runStart) * bytesPerCluster;
 
                     // Stop at target boundary
-                    if (runByteOffset >= partition.StartingOffset + partition.TargetSizeBytes)
+                    if (runTargetByteOffset >= targetPartitionOffset + partition.TargetSizeBytes)
                         break;
-                    if (runByteOffset + runByteLength > partition.StartingOffset + partition.TargetSizeBytes)
-                        runByteLength = (partition.StartingOffset + partition.TargetSizeBytes) - runByteOffset;
+                    if (runTargetByteOffset + runByteLength > targetPartitionOffset + partition.TargetSizeBytes)
+                        runByteLength = (targetPartitionOffset + partition.TargetSizeBytes) - runTargetByteOffset;
 
                     // Align to sector
                     uint toProcess = (uint)(((runByteLength + sectorSize - 1) / sectorSize) * sectorSize);
 
                     // Seek target
-                    if (!WindowsApi.SetFilePointerEx(targetHandle, runByteOffset, out _, WindowsApi.FILE_BEGIN))
+                    if (!WindowsApi.SetFilePointerEx(targetHandle, runTargetByteOffset, out _, WindowsApi.FILE_BEGIN))
                     {
                         var error = Marshal.GetLastWin32Error();
-                        throw new IOException($"Failed to seek target at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                        throw new IOException($"Failed to seek target at {runTargetByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
                     }
 
                     if (isAllocated)
                     {
                         // Seek source and read
-                        if (!WindowsApi.SetFilePointerEx(sourceHandle, runByteOffset, out _, WindowsApi.FILE_BEGIN))
+                        if (!WindowsApi.SetFilePointerEx(sourceHandle, runSourceByteOffset, out _, WindowsApi.FILE_BEGIN))
                         {
                             var error = Marshal.GetLastWin32Error();
-                            throw new IOException($"Failed to seek source at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                            throw new IOException($"Failed to seek source at {runSourceByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
                         }
 
                         uint bytesRead;
                         if (!WindowsApi.ReadFile(sourceHandle, nativeBuffer, toProcess, out bytesRead, IntPtr.Zero))
                         {
                             var error = Marshal.GetLastWin32Error();
-                            throw new IOException($"Failed to read source at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                            throw new IOException($"Failed to read source at {runSourceByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
                         }
 
                         uint bytesWritten;
                         if (!WindowsApi.WriteFile(targetHandle, nativeBuffer, bytesRead, out bytesWritten, IntPtr.Zero))
                         {
                             var error = Marshal.GetLastWin32Error();
-                            throw new IOException($"Failed to write target at {runByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                            throw new IOException($"Failed to write target at {runTargetByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
                         }
 
                         partitionBytesCopied += bytesRead;
@@ -1016,7 +1143,11 @@ public class DiskClonerEngine
                     {
                         // Write zeros for free clusters (ensures target has valid zeroed free space)
                         uint bytesWritten;
-                        WindowsApi.WriteFile(targetHandle, zeroBuffer, toProcess, out bytesWritten, IntPtr.Zero);
+                        if (!WindowsApi.WriteFile(targetHandle, zeroBuffer, toProcess, out bytesWritten, IntPtr.Zero))
+                        {
+                            var error = Marshal.GetLastWin32Error();
+                            throw new IOException($"Failed to write zeroed free space at {runTargetByteOffset}: {WindowsApi.GetErrorMessage((uint)error)}");
+                        }
                         partitionBytesCopied += toProcess;
                     }
 
@@ -1079,12 +1210,13 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             using var sha256 = SHA256.Create();
-            var offset = partition.StartingOffset;
+            var sourceOffset = partition.StartingOffset;
+            var targetOffset = GetRequiredTargetStartingOffset(partition);
 
             // Read and hash source
             var sourceHash = await ComputeHashAsync(
                 operation.SourceDisk.DiskNumber,
-                offset,
+                sourceOffset,
                 partition.TargetSizeBytes,
                 bufferSize,
                 sha256);
@@ -1092,7 +1224,7 @@ public class DiskClonerEngine
             // Read and hash target
             var targetHash = await ComputeHashAsync(
                 operation.TargetDisk.DiskNumber,
-                offset,
+                targetOffset,
                 partition.TargetSizeBytes,
                 bufferSize,
                 sha256);
@@ -1126,6 +1258,8 @@ public class DiskClonerEngine
         {
             progress.CurrentPartitionName = $"Verifying {partition.GetTypeName()} (sampling)";
             ReportProgress(progress);
+            var sourcePartitionOffset = partition.StartingOffset;
+            var targetPartitionOffset = GetRequiredTargetStartingOffset(partition);
 
             var samplesChecked = 0;
 
@@ -1135,29 +1269,33 @@ public class DiskClonerEngine
                     break;
 
                 // Calculate sample position
-                var sampleOffset = partition.StartingOffset +
+                var sourceSampleOffset = sourcePartitionOffset +
+                    (partition.TargetSizeBytes * i / sampleCount);
+                var targetSampleOffset = targetPartitionOffset +
                     (partition.TargetSizeBytes * i / sampleCount);
 
                 // Ensure we don't go past the end
-                sampleOffset = Math.Min(sampleOffset,
-                    partition.StartingOffset + partition.TargetSizeBytes - bufferSize);
+                sourceSampleOffset = Math.Min(sourceSampleOffset,
+                    sourcePartitionOffset + partition.TargetSizeBytes - bufferSize);
+                targetSampleOffset = Math.Min(targetSampleOffset,
+                    targetPartitionOffset + partition.TargetSizeBytes - bufferSize);
 
                 // Calculate actual sample size (might be smaller near the end)
                 var sampleSize = Math.Min(bufferSize,
-                    partition.StartingOffset + partition.TargetSizeBytes - sampleOffset);
+                    sourcePartitionOffset + partition.TargetSizeBytes - sourceSampleOffset);
 
                 using var sha256 = SHA256.Create();
 
                 var sourceHash = await ComputeHashAsync(
                     operation.SourceDisk.DiskNumber,
-                    sampleOffset,
+                    sourceSampleOffset,
                     sampleSize,
                     (int)sampleSize,
                     sha256);
 
                 var targetHash = await ComputeHashAsync(
                     operation.TargetDisk.DiskNumber,
-                    sampleOffset,
+                    targetSampleOffset,
                     sampleSize,
                     (int)sampleSize,
                     sha256);

@@ -28,6 +28,12 @@ public class PartitionInfo
     public long TargetSizeBytes { get; set; }
 
     /// <summary>
+    /// The starting offset on the target disk after partition table creation.
+    /// This may differ from StartingOffset when cloning to a smaller disk.
+    /// </summary>
+    public long TargetStartingOffset { get; set; }
+
+    /// <summary>
     /// For GPT: The partition type GUID.
     /// </summary>
     public Guid? PartitionTypeGuid { get; set; }
