@@ -624,15 +624,8 @@ public class DiskClonerEngine
 
             try
             {
-                var offset = partition.StartingOffset;
+                var relativeOffset = 0L;
                 var lastProgressUpdate = DateTime.UtcNow;
-
-                // Ensure starting offset is sector-aligned
-                if (offset % sectorSize != 0)
-                {
-                    _logger.Warning($"Partition starting offset {offset} is not sector-aligned, rounding down");
-                    offset = (offset / sectorSize) * sectorSize;
-                }
 
                 while (partitionBytesCopied < totalBytesInPartition)
                 {
@@ -648,11 +641,14 @@ public class DiskClonerEngine
                     // Round up to sector size for physical disk I/O
                     bytesToRead = ((bytesToRead + sectorSize - 1) / sectorSize) * sectorSize;
 
+                    long absoluteSourceOffset = partition.StartingOffset + relativeOffset;
+                    long absoluteTargetOffset = partition.StartingOffset + relativeOffset; // Assuming 1:1 layout for now
+
                     // Seek to source position
-                    if (!WindowsApi.SetFilePointerEx(sourceHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                    if (!WindowsApi.SetFilePointerEx(sourceHandle, absoluteSourceOffset, out _, WindowsApi.FILE_BEGIN))
                     {
                         var error = Marshal.GetLastWin32Error();
-                        throw new IOException($"Failed to seek source at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                        throw new IOException($"Failed to seek source at offset {absoluteSourceOffset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
                     }
 
                     // Read from source using native buffer
@@ -660,12 +656,12 @@ public class DiskClonerEngine
                     if (!WindowsApi.ReadFile(sourceHandle, nativeBuffer, (uint)bytesToRead, out bytesRead, IntPtr.Zero))
                     {
                         var error = Marshal.GetLastWin32Error();
-                        throw new IOException($"Failed to read from source at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                        throw new IOException($"Failed to read from source at offset {absoluteSourceOffset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
                     }
 
                     if (bytesRead == 0)
                     {
-                        _logger.Warning($"Read 0 bytes at offset {offset}, stopping partition copy");
+                        _logger.Warning($"Read 0 bytes at offset {absoluteSourceOffset}, stopping partition copy");
                         break;
                     }
 
@@ -673,10 +669,10 @@ public class DiskClonerEngine
                     uint bytesToWrite = ((bytesRead + (uint)sectorSize - 1) / (uint)sectorSize) * (uint)sectorSize;
 
                     // Seek to target position
-                    if (!WindowsApi.SetFilePointerEx(targetHandle, offset, out _, WindowsApi.FILE_BEGIN))
+                    if (!WindowsApi.SetFilePointerEx(targetHandle, absoluteTargetOffset, out _, WindowsApi.FILE_BEGIN))
                     {
                         var error = Marshal.GetLastWin32Error();
-                        throw new IOException($"Failed to seek target at offset {offset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                        throw new IOException($"Failed to seek target at offset {absoluteTargetOffset}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
                     }
 
                     // Write to target using native buffer
@@ -684,11 +680,11 @@ public class DiskClonerEngine
                     if (!WindowsApi.WriteFile(targetHandle, nativeBuffer, bytesToWrite, out bytesWritten, IntPtr.Zero))
                     {
                         var error = Marshal.GetLastWin32Error();
-                        throw new IOException($"Failed to write to target at offset {offset}, size {bytesToWrite}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
+                        throw new IOException($"Failed to write to target at offset {absoluteTargetOffset}, size {bytesToWrite}: {WindowsApi.GetErrorMessage((uint)error)} (Error {error})");
                     }
 
                     partitionBytesCopied += bytesRead;
-                    offset += bytesRead;
+                    relativeOffset += bytesRead;
 
                     // Update progress periodically
                     if (DateTime.UtcNow - lastProgressUpdate > TimeSpan.FromMilliseconds(250))
@@ -736,7 +732,20 @@ public class DiskClonerEngine
 
         var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
+        
+        // Determine the correct volume path (use VSS snapshot if enabled and available)
         var volumePath = $@"\\.\{partition.DriveLetter!.Value}:";
+        if (operation.UseVss)
+        {
+            var originalVolumePath = $@"{partition.DriveLetter.Value}:\";
+            var snapshotPath = _vssService.GetSnapshotVolumePath(originalVolumePath);
+            if (!string.IsNullOrEmpty(snapshotPath))
+            {
+                // Remove trailing backslash for CreateFile
+                volumePath = snapshotPath.TrimEnd('\\');
+                _logger.Info($"Using VSS snapshot path for bitmap: {volumePath}");
+            }
+        }
 
         var partitionBytesCopied = 0L;
         const int sectorSize = 512;
@@ -749,6 +758,8 @@ public class DiskClonerEngine
             // --- Step 1: Read the NTFS bitmap from the volume ---
             _logger.Info($"Reading NTFS bitmap from volume {volumePath}");
 
+            // Note: VSS snapshot volumes might require different access flags.
+            // Try FILE_SHARE_READ | FILE_SHARE_WRITE first, just like raw copy.
             using var volumeHandle = WindowsApi.CreateFile(
                 volumePath,
                 WindowsApi.GENERIC_READ,
@@ -757,6 +768,7 @@ public class DiskClonerEngine
                 WindowsApi.OPEN_EXISTING,
                 0,
                 IntPtr.Zero);
+
 
             if (volumeHandle.IsInvalid)
             {

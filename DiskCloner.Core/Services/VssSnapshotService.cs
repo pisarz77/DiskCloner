@@ -122,9 +122,25 @@ public class VssSnapshotService : IDisposable
     }
 
     /// <summary>
+    /// Gets the snapshot volume path for a given original volume, if a snapshot exists.
+    /// </summary>
+    /// <param name="originalVolume">The original volume path (e.g., @"C:\")</param>
+    /// <returns>The snapshot device name (e.g., \\?\GLOBALROOT\...), or null if no snapshot exists.</returns>
+    public string? GetSnapshotVolumePath(string originalVolume)
+    {
+        var normalized = NormalizeVolumePath(originalVolume);
+        if (_snapshotVolumes.TryGetValue(normalized, out var snapshotPath))
+        {
+            return snapshotPath;
+        }
+        return null;
+    }
+
+    /// <summary>
     /// Deletes all created snapshots.
     /// </summary>
     public async Task DeleteSnapshotsAsync()
+
     {
         if (_backupComponents == null || _snapshotSetId == Guid.Empty)
             return;

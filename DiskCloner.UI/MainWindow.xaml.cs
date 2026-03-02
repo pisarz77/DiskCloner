@@ -361,6 +361,7 @@ public partial class MainWindow : Window
         VerifyIntegrityCheckBox.IsEnabled = enabled;
         FullHashCheckBox.IsEnabled = enabled;
         AutoExpandCheckBox.IsEnabled = enabled;
+        SmartCopyCheckBox.IsEnabled = enabled;
         AllowSmallerTargetCheckBox.IsEnabled = enabled;
         BufferSizeComboBox.IsEnabled = enabled;
         PreviewButton.IsEnabled = enabled;
@@ -575,6 +576,7 @@ public partial class MainWindow : Window
             FullHashVerification = FullHashCheckBox.IsChecked.GetValueOrDefault(),
             AutoExpandWindowsPartition = AutoExpandCheckBox.IsChecked.GetValueOrDefault(),
             AllowSmallerTarget = AllowSmallerTargetCheckBox.IsChecked.GetValueOrDefault(),
+            SmartCopy = SmartCopyCheckBox.IsChecked.GetValueOrDefault(),
             LogFilePath = LogFileTextBlock.Text
         };
 

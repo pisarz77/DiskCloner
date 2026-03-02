@@ -130,6 +130,13 @@
                         <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
                                    Text="If target disk is larger than source, the Windows partition will be expanded to use all available space."/>
 
+                        <!-- Smart Copy Option -->
+                        <CheckBox x:Name="SmartCopyCheckBox" IsChecked="True" Margin="0,0,0,15">
+                            <TextBlock Text="Smart copy (skip free sectors)" TextWrapping="Wrap"/>
+                        </CheckBox>
+                        <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
+                                   Text="Only copies actual data on NTFS partitions. Faster and required for shrinking to a smaller target disk."/>
+
                         <!-- Allow Smaller Target Option -->
                         <CheckBox x:Name="AllowSmallerTargetCheckBox" IsChecked="False" Margin="0,0,0,15">
                             <TextBlock Text="Allow smaller target disk" TextWrapping="Wrap"/>
