@@ -373,6 +373,8 @@ public partial class MainWindow : Window
         PreviewButton.IsEnabled = enabled;
         ConfirmationTextBox.IsEnabled = enabled;
         CloneButton.IsEnabled = enabled;
+        RunRobocopyProbeButton.IsEnabled = enabled;
+        ProbeMaxFilesTextBox.IsEnabled = enabled;
         
         // Disable "Refresh Disks" buttons (they don't have names, so we'll find them)
         foreach (var child in FindVisualChildren<Button>(this))
@@ -382,6 +384,106 @@ public partial class MainWindow : Window
                 child.IsEnabled = enabled;
             }
         }
+    }
+
+    private async void RunRobocopyProbeButton_Click(object sender, RoutedEventArgs e)
+    {
+        if (_isCloning)
+        {
+            MessageBox.Show("Cannot run diagnostics while clone is in progress.", "Busy",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        if (!int.TryParse(ProbeMaxFilesTextBox.Text, out var maxFiles) || maxFiles <= 0)
+        {
+            MessageBox.Show("Invalid max files value. Enter a positive number.", "Validation Error",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        if (maxFiles > 300)
+            maxFiles = 300;
+
+        var logPath = ResolveProbeLogPath();
+        if (string.IsNullOrWhiteSpace(logPath) || !File.Exists(logPath))
+        {
+            MessageBox.Show("No clone log file found for diagnostics.", "Probe",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        var destinationRoot = Path.Combine(
+            Path.GetTempPath(),
+            "DiskCloner",
+            "RobocopyProbe",
+            DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
+
+        var fallbackDrive = GetSystemDriveLetter();
+        ProbeStatusTextBlock.Text = "Running robocopy probe...";
+        RunRobocopyProbeButton.IsEnabled = false;
+
+        try
+        {
+            var probeService = new RobocopyFailureProbeService(_logger!);
+            var probeResult = await probeService.ProbeFromLogAsync(
+                logPath,
+                destinationRoot,
+                maxFiles,
+                fallbackDrive);
+
+            ProbeStatusTextBlock.Text =
+                $"Probe completed. Tested {probeResult.FilesTested}, success {probeResult.SuccessCount}, failed {probeResult.FailureCount}.";
+
+            MessageBox.Show(
+                $"Robocopy probe finished.\n\n" +
+                $"Discovered: {probeResult.DiscoveredFailurePaths}\n" +
+                $"Tested: {probeResult.FilesTested}\n" +
+                $"Success: {probeResult.SuccessCount}\n" +
+                $"Failed: {probeResult.FailureCount}\n\n" +
+                $"Summary:\n{probeResult.SummaryFilePath}",
+                "Probe Result",
+                MessageBoxButton.OK,
+                probeResult.FailureCount == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+        }
+        catch (Exception ex)
+        {
+            _logger?.Error("Robocopy probe failed", ex);
+            ProbeStatusTextBlock.Text = $"Probe failed: {ex.Message}";
+            MessageBox.Show($"Robocopy probe failed: {ex.Message}", "Probe Error",
+                MessageBoxButton.OK, MessageBoxImage.Error);
+        }
+        finally
+        {
+            RunRobocopyProbeButton.IsEnabled = true;
+        }
+    }
+
+    private string? ResolveProbeLogPath()
+    {
+        if (_logger is FileLogger fileLogger && File.Exists(fileLogger.LogFilePath))
+            return fileLogger.LogFilePath;
+
+        var processPath = Environment.ProcessPath;
+        var baseDirectory = !string.IsNullOrWhiteSpace(processPath)
+            ? (Path.GetDirectoryName(processPath) ?? AppContext.BaseDirectory)
+            : AppContext.BaseDirectory;
+
+        var latestLog = Directory.EnumerateFiles(baseDirectory, "clone_*.log", SearchOption.TopDirectoryOnly)
+            .Select(path => new FileInfo(path))
+            .OrderByDescending(info => info.LastWriteTimeUtc)
+            .FirstOrDefault();
+
+        return latestLog?.FullName;
+    }
+
+    private static char GetSystemDriveLetter()
+    {
+        var root = Path.GetPathRoot(Environment.SystemDirectory);
+        if (!string.IsNullOrWhiteSpace(root) && root.Length >= 2 && root[1] == ':')
+            return root[0];
+
+        return 'C';
     }
 
     private static IEnumerable<T> FindVisualChildren<T>(DependencyObject depObj) where T : DependencyObject

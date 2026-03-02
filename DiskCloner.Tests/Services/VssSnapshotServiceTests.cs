@@ -273,7 +273,20 @@ public class VssSnapshotServiceTests
     public async Task ResolveVolumeGuidAsync_ReturnsNullForInvalidDrive()
     {
         // Arrange
-        var driveLetter = 'Z';
+        var usedLetters = DriveInfo.GetDrives()
+            .Where(d => !string.IsNullOrWhiteSpace(d.Name))
+            .Select(d => char.ToUpperInvariant(d.Name[0]))
+            .ToHashSet();
+
+        var driveLetter = Enumerable.Range('A', 26)
+            .Select(i => (char)i)
+            .FirstOrDefault(letter => !usedLetters.Contains(letter));
+
+        if (driveLetter == default)
+        {
+            // Environment has all letters occupied/mapped, nothing meaningful to assert.
+            return;
+        }
 
         // Act
         var result = await _vssService.ResolveVolumeGuidAsync(driveLetter);
