@@ -1,5 +1,7 @@
 using System;
 using System.IO;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using DiskCloner.Core.Logging;
 using Xunit;
@@ -14,7 +16,7 @@ public class FileLoggerTests : IDisposable
 
     public FileLoggerTests()
     {
-        _testLogDirectory = Path.Combine(Path.GetTempPath(), "DiskClonerTests", "Logs");
+        _testLogDirectory = Path.Combine(Path.GetTempPath(), "DiskClonerTests", "Logs", Guid.NewGuid().ToString("N"));
         _testLogFilePath = Path.Combine(_testLogDirectory, "test.log");
         
         // Ensure directory exists
@@ -27,6 +29,7 @@ public class FileLoggerTests : IDisposable
     {
         try
         {
+            _logger.Dispose();
             if (File.Exists(_testLogFilePath))
             {
                 File.Delete(_testLogFilePath);
@@ -53,21 +56,21 @@ public class FileLoggerTests : IDisposable
     public void FileLogger_Constructor_ThrowsOnEmptyPath()
     {
         // Act & Assert
-        Assert.Throws<ArgumentException>(() => new FileLogger(string.Empty));
+        Assert.Throws<ArgumentNullException>(() => new FileLogger(string.Empty));
     }
 
     [Fact]
     public void FileLogger_Constructor_ThrowsOnWhitespacePath()
     {
         // Act & Assert
-        Assert.Throws<ArgumentException>(() => new FileLogger("   "));
+        Assert.Throws<ArgumentNullException>(() => new FileLogger("   "));
     }
 
     [Fact]
     public void FileLogger_Constructor_AcceptsValidPath()
     {
         // Arrange & Act
-        var logger = new FileLogger(_testLogFilePath);
+        using var logger = new FileLogger(_testLogFilePath);
 
         // Assert
         Assert.NotNull(logger);
@@ -77,7 +80,7 @@ public class FileLoggerTests : IDisposable
     public void FileLogger_Constructor_CreatesLogFile()
     {
         // Arrange & Act
-        var logger = new FileLogger(_testLogFilePath);
+        using var logger = new FileLogger(_testLogFilePath);
 
         // Assert
         Assert.True(File.Exists(_testLogFilePath));
@@ -87,15 +90,16 @@ public class FileLoggerTests : IDisposable
     public void FileLogger_Constructor_CreatesDirectoryIfNotExists()
     {
         // Arrange
-        var newLogDir = Path.Combine(Path.GetTempPath(), "DiskClonerTests", "NewLogs");
+        var newLogDir = Path.Combine(Path.GetTempPath(), "DiskClonerTests", "NewLogs", Guid.NewGuid().ToString("N"));
         var newLogPath = Path.Combine(newLogDir, "new.log");
 
         // Act
-        var logger = new FileLogger(newLogPath);
-
-        // Assert
-        Assert.True(Directory.Exists(newLogDir));
-        Assert.True(File.Exists(newLogPath));
+        using (var logger = new FileLogger(newLogPath))
+        {
+            // Assert
+            Assert.True(Directory.Exists(newLogDir));
+            Assert.True(File.Exists(newLogPath));
+        }
 
         // Cleanup
         Directory.Delete(newLogDir, true);
@@ -111,9 +115,9 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("INFO", logContent);
+        Assert.Contains("Info", logContent);
     }
 
     [Fact]
@@ -126,9 +130,9 @@ public class FileLoggerTests : IDisposable
         _logger.Warning(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("WARNING", logContent);
+        Assert.Contains("Warning", logContent);
     }
 
     [Fact]
@@ -141,9 +145,9 @@ public class FileLoggerTests : IDisposable
         _logger.Error(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("ERROR", logContent);
+        Assert.Contains("Error", logContent);
     }
 
     [Fact]
@@ -157,9 +161,9 @@ public class FileLoggerTests : IDisposable
         _logger.Error(message, exception);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("ERROR", logContent);
+        Assert.Contains("Error", logContent);
         Assert.Contains("Test exception", logContent);
     }
 
@@ -173,9 +177,9 @@ public class FileLoggerTests : IDisposable
         _logger.Debug(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("DEBUG", logContent);
+        Assert.Contains("Debug", logContent);
     }
 
     [Fact]
@@ -188,7 +192,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(DateTime.Now.ToString("yyyy-MM-dd"), logContent);
     }
 
@@ -202,8 +206,8 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
-        Assert.Contains("[INFO]", logContent);
+        var logContent = ReadLogContent();
+        Assert.Contains("Info]", logContent);
     }
 
     [Fact]
@@ -216,7 +220,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
     }
 
@@ -230,7 +234,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.EndsWith(Environment.NewLine, logContent);
     }
 
@@ -248,13 +252,13 @@ public class FileLoggerTests : IDisposable
         _logger.Error(message3);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message1, logContent);
         Assert.Contains(message2, logContent);
         Assert.Contains(message3, logContent);
-        Assert.Contains("INFO", logContent);
-        Assert.Contains("WARNING", logContent);
-        Assert.Contains("ERROR", logContent);
+        Assert.Contains("Info", logContent);
+        Assert.Contains("Warning", logContent);
+        Assert.Contains("Error", logContent);
     }
 
     [Fact]
@@ -268,11 +272,10 @@ public class FileLoggerTests : IDisposable
         _logger.Error(message, exception);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
-        Assert.Contains("InvalidOperationException", logContent);
-        Assert.Contains("ArgumentException", logContent);
-        Assert.Contains("Inner exception", logContent);
+        Assert.Contains("Test exception", logContent);
+        Assert.Contains("Stack Trace:", logContent);
     }
 
     [Fact]
@@ -285,7 +288,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(message, logContent);
     }
 
@@ -299,7 +302,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(longMessage);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(longMessage, logContent);
     }
 
@@ -313,8 +316,8 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
-        Assert.Contains("[INFO]", logContent);
+        var logContent = ReadLogContent();
+        Assert.Contains("Info]", logContent);
         Assert.Contains(":", logContent);
     }
 
@@ -322,14 +325,14 @@ public class FileLoggerTests : IDisposable
     public void NullMessage_IsHandled()
     {
         // Arrange
-        string message = null;
+        string? message = null;
 
         // Act
-        _logger.Info(message);
+        _logger.Info(message!);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
-        Assert.Contains("[INFO]", logContent);
+        var logContent = ReadLogContent();
+        Assert.Contains("Info]", logContent);
         Assert.Contains(":", logContent);
     }
 
@@ -343,7 +346,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(unicodeMessage);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.Contains(unicodeMessage, logContent);
     }
 
@@ -366,7 +369,7 @@ public class FileLoggerTests : IDisposable
         Task.WaitAll(tasks);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         for (int i = 0; i < 10; i++)
         {
             Assert.Contains($"Concurrent message {i}", logContent);
@@ -397,7 +400,7 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         Assert.NotNull(logContent);
         Assert.NotEmpty(logContent);
     }
@@ -412,13 +415,33 @@ public class FileLoggerTests : IDisposable
         _logger.Info(message);
 
         // Assert
-        var logContent = File.ReadAllText(_testLogFilePath);
+        var logContent = ReadLogContent();
         var lines = logContent.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
-        var logLine = lines[0];
+        var logLine = lines.FirstOrDefault(l => l.Contains(message)) ?? string.Empty;
         
         // Should contain: timestamp, level, message
-        Assert.Contains("[INFO]", logLine);
+        Assert.Contains("Info]", logLine);
         Assert.Contains(":", logLine);
         Assert.Contains(message, logLine);
     }
+
+    private string ReadLogContent()
+    {
+        for (int i = 0; i < 10; i++)
+        {
+            try
+            {
+                using var stream = new FileStream(_testLogFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                return reader.ReadToEnd();
+            }
+            catch (IOException) when (i < 9)
+            {
+                Thread.Sleep(25);
+            }
+        }
+
+        return string.Empty;
+    }
 }
+

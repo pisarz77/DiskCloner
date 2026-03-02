@@ -19,6 +19,9 @@ public class DiskClonerEngine
     private static readonly Regex DiskPartPartitionLineRegex = new(
         @"^\s*\*?\s*Partition\s+(?<number>\d+)\s+(?<type>.+?)\s+(?<sizeValue>\d+[\d.,]*)\s+(?<sizeUnit>KB|MB|GB|TB|B|Bytes)?\s+(?<offsetValue>\d+[\d.,]*)\s+(?<offsetUnit>KB|MB|GB|TB|B|Bytes)?(\s+.*)?$",
         RegexOptions.Compiled | RegexOptions.IgnoreCase);
+    private static readonly Regex RobocopyTimestampedErrorRegex = new(
+        @"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+ERROR\s+\d+\s+\(0x[0-9A-Fa-f]+\)",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     private readonly ILogger _logger;
     private readonly DiskEnumerator _diskEnumerator;
@@ -97,68 +100,126 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             progress.TotalPartitions = operation.PartitionsToClone.Count;
-            var totalBytesToCopy = operation.PartitionsToClone.Sum(p => p.TargetSizeBytes);
+            var totalBytesToCopy = CalculatePlannedTotalBytes(operation);
             progress.TotalBytes = totalBytesToCopy;
             var bytesCopied = 0L;
             var migratedPartitionNumbers = new HashSet<int>();
+            var targetDiskIsOffline = true;
+            var partitionCopyFailures = new List<string>();
+            Exception? firstPartitionCopyException = null;
 
-            foreach (var partition in operation.PartitionsToClone)
+            for (int partitionIndex = 0; partitionIndex < operation.PartitionsToClone.Count; partitionIndex++)
             {
+                var partition = operation.PartitionsToClone[partitionIndex];
+
                 if (_cancellationTokenSource.Token.IsCancellationRequested)
                 {
                     throw new OperationCanceledException("Operation was cancelled by user");
                 }
 
-                progress.CurrentPartition = operation.PartitionsToClone.IndexOf(partition);
+                progress.CurrentPartition = partitionIndex;
                 progress.CurrentPartitionName = partition.GetTypeName();
                 var strategy = GetCopyStrategy(operation, partition);
 
-                if (strategy == CopyStrategy.FileSystemMigration)
+                try
                 {
-                    progress.StatusMessage = $"Queueing file-system migration for {partition.GetTypeName()} ({partition.SizeDisplay})...";
+                    if (strategy == CopyStrategy.FileSystemMigration)
+                    {
+                        progress.StatusMessage = $"Migrating {partition.GetTypeName()} ({partition.SizeDisplay}) using file copy...";
+                        ReportProgress(progress);
+                        if (targetDiskIsOffline)
+                        {
+                            progress.StatusMessage = "Bringing target disk online for file-system migration...";
+                            ReportProgress(progress);
+                            await OnlineTargetDiskAsync(operation);
+                            targetDiskIsOffline = false;
+                        }
+
+                        var migrationPlannedBytes = GetEstimatedMigrationBytes(partition);
+                        var migratedBytes = await MigratePartitionFileSystemAsync(operation, partition, result, progress, bytesCopied, migrationPlannedBytes);
+                        migratedPartitionNumbers.Add(partition.PartitionNumber);
+                        if (migratedBytes > migrationPlannedBytes)
+                        {
+                            var delta = migratedBytes - migrationPlannedBytes;
+                            totalBytesToCopy += delta;
+                            progress.TotalBytes = totalBytesToCopy;
+                            _logger.Info(
+                                $"Migration for partition {partition.PartitionNumber} exceeded estimate by {delta:N0} bytes; " +
+                                $"adjusted total planned bytes.");
+                        }
+
+                        bytesCopied += migratedBytes;
+                        progress.BytesCopied = Math.Min(bytesCopied, totalBytesToCopy);
+                        progress.PercentComplete = (progress.BytesCopied * 100.0) / totalBytesToCopy;
+                        progress.ThroughputBytesPerSec = 0;
+                        progress.EstimatedTimeRemaining = TimeSpan.Zero;
+                        ReportProgress(progress);
+
+                        var remainingNeedsRawDiskCopy = operation.PartitionsToClone
+                            .Skip(partitionIndex + 1)
+                            .Any(next => GetCopyStrategy(operation, next) != CopyStrategy.FileSystemMigration);
+
+                        if (remainingNeedsRawDiskCopy)
+                        {
+                            await OfflineTargetDiskAsync(operation);
+                            targetDiskIsOffline = true;
+                        }
+                    }
+                    else
+                    {
+                        if (!targetDiskIsOffline)
+                        {
+                            await OfflineTargetDiskAsync(operation);
+                            targetDiskIsOffline = true;
+                        }
+
+                        if (strategy == CopyStrategy.SmartBlock)
+                        {
+                            progress.StatusMessage = $"Smart-copying {partition.GetTypeName()} ({partition.SizeDisplay}) - reading NTFS bitmap...";
+                            ReportProgress(progress);
+                            bytesCopied = await CopyPartitionSmartAsync(operation, partition, progress, bytesCopied);
+                        }
+                        else
+                        {
+                            progress.StatusMessage = $"Copying {partition.GetTypeName()} ({partition.SizeDisplay})...";
+                            ReportProgress(progress);
+                            bytesCopied = await CopyPartitionAsync(operation, partition, progress, bytesCopied);
+                        }
+
+                        progress.BytesCopied = bytesCopied;
+                        progress.PercentComplete = (bytesCopied * 100.0) / totalBytesToCopy;
+                        ReportProgress(progress);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    firstPartitionCopyException ??= ex;
+                    var failureMessage = $"Partition {partition.PartitionNumber} ({partition.GetTypeName()}) failed during {strategy}: {ex.Message}";
+                    partitionCopyFailures.Add(failureMessage);
+                    _logger.Error(failureMessage, ex);
+
+                    progress.LastError = failureMessage;
+                    progress.StatusMessage = $"{failureMessage} Continuing with remaining partitions...";
                     ReportProgress(progress);
-                    migratedPartitionNumbers.Add(partition.PartitionNumber);
-                    _logger.Info($"Partition {partition.PartitionNumber} will use file-system migration after raw block copies.");
-                    continue;
                 }
 
-                if (strategy == CopyStrategy.SmartBlock)
+                if (_cancellationTokenSource.Token.IsCancellationRequested)
                 {
-                    progress.StatusMessage = $"Smart-copying {partition.GetTypeName()} ({partition.SizeDisplay}) - reading NTFS bitmap...";
-                    ReportProgress(progress);
-                    bytesCopied = await CopyPartitionSmartAsync(operation, partition, progress, bytesCopied);
-                }
-                else
-                {
-                    progress.StatusMessage = $"Copying {partition.GetTypeName()} ({partition.SizeDisplay})...";
-                    ReportProgress(progress);
-                    bytesCopied = await CopyPartitionAsync(operation, partition, progress, bytesCopied);
-                }
-
-                progress.BytesCopied = bytesCopied;
-                progress.PercentComplete = (bytesCopied * 100.0) / totalBytesToCopy;
-                ReportProgress(progress);
-            }
-
-            if (migratedPartitionNumbers.Count > 0)
-            {
-                progress.StatusMessage = "Bringing target online for NTFS file-system migration...";
-                ReportProgress(progress);
-                await OnlineTargetDiskAsync(operation);
-
-                foreach (var partition in operation.PartitionsToClone.Where(p => migratedPartitionNumbers.Contains(p.PartitionNumber)))
-                {
-                    progress.StatusMessage = $"Migrating {partition.GetTypeName()} using file copy...";
-                    ReportProgress(progress);
-                    await MigratePartitionFileSystemAsync(operation, partition, result);
-                    bytesCopied += partition.TargetSizeBytes;
-                    progress.BytesCopied = Math.Min(bytesCopied, totalBytesToCopy);
-                    progress.PercentComplete = (progress.BytesCopied * 100.0) / totalBytesToCopy;
-                    ReportProgress(progress);
+                    throw new OperationCanceledException("Operation was cancelled by user");
                 }
             }
 
             result.BytesCopied = bytesCopied;
+            if (partitionCopyFailures.Count > 0)
+            {
+                throw new InvalidOperationException(
+                    "One or more partitions failed during copy: " + string.Join(" | ", partitionCopyFailures),
+                    firstPartitionCopyException);
+            }
 
             // Step 5: Verify data integrity
             if (operation.VerifyIntegrity)
@@ -936,7 +997,7 @@ public class DiskClonerEngine
                     if (_cancellationTokenSource.Token.IsCancellationRequested)
                     {
                         _logger.Warning("Copy operation cancelled");
-                        break;
+                        throw new OperationCanceledException("Operation was cancelled by user");
                     }
 
                     // Calculate bytes to read, rounded UP to sector boundary
@@ -1018,11 +1079,8 @@ public class DiskClonerEngine
                             : 0;
                         progress.PercentComplete = (currentTotalCopied * 100.0) / progress.TotalBytes;
 
-                        var remainingBytes = progress.TotalBytes - progress.BytesCopied;
-                        if (progress.ThroughputBytesPerSec > 0)
-                        {
-                            progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(remainingBytes / progress.ThroughputBytesPerSec);
-                        }
+                        var remainingBytes = Math.Max(0L, progress.TotalBytes - progress.BytesCopied);
+                        progress.EstimatedTimeRemaining = CalculateSafeEta(remainingBytes, progress.ThroughputBytesPerSec);
 
                         ReportProgress(progress);
                         lastProgressUpdate = now;
@@ -1354,7 +1412,7 @@ public class DiskClonerEngine
                     if (_cancellationTokenSource.Token.IsCancellationRequested)
                     {
                         _logger.Warning("Smart copy cancelled");
-                        break;
+                        throw new OperationCanceledException("Operation was cancelled by user");
                     }
 
                     // Find next run of same state (allocated or free)
@@ -1440,9 +1498,8 @@ public class DiskClonerEngine
                             ? bytesSinceLastUpdate / elapsedSec
                             : 0;
                         progress.PercentComplete = Math.Min(100.0, (currentTotalCopied * 100.0) / progress.TotalBytes);
-                        var remainingBytes = progress.TotalBytes - progress.BytesCopied;
-                        if (progress.ThroughputBytesPerSec > 0)
-                            progress.EstimatedTimeRemaining = TimeSpan.FromSeconds(remainingBytes / progress.ThroughputBytesPerSec);
+                        var remainingBytes = Math.Max(0L, progress.TotalBytes - progress.BytesCopied);
+                        progress.EstimatedTimeRemaining = CalculateSafeEta(remainingBytes, progress.ThroughputBytesPerSec);
                         ReportProgress(progress);
                         lastProgressUpdate = now;
                         bytesSinceLastUpdate = 0;
@@ -1516,6 +1573,49 @@ public class DiskClonerEngine
         return useSmartCopy ? CopyStrategy.SmartBlock : CopyStrategy.RawBlock;
     }
 
+    private long CalculatePlannedTotalBytes(CloneOperation operation)
+    {
+        long total = 0;
+        foreach (var partition in operation.PartitionsToClone)
+        {
+            var strategy = GetCopyStrategy(operation, partition);
+            if (strategy == CopyStrategy.FileSystemMigration)
+            {
+                total += GetEstimatedMigrationBytes(partition);
+            }
+            else
+            {
+                total += partition.TargetSizeBytes;
+            }
+        }
+
+        return Math.Max(1, total);
+    }
+
+    private long GetEstimatedMigrationBytes(PartitionInfo partition)
+    {
+        if (!partition.DriveLetter.HasValue)
+            return partition.TargetSizeBytes;
+
+        try
+        {
+            var drive = new DriveInfo($"{NormalizeDriveLetter(partition.DriveLetter.Value)}:\\");
+            if (!drive.IsReady)
+                return partition.TargetSizeBytes;
+
+            long used = Math.Max(0, drive.TotalSize - drive.AvailableFreeSpace);
+            if (used <= 0)
+                return partition.TargetSizeBytes;
+
+            // Migration can't exceed target partition size.
+            return Math.Min(partition.TargetSizeBytes, used);
+        }
+        catch
+        {
+            return partition.TargetSizeBytes;
+        }
+    }
+
     private static char? GetSourceSystemDriveLetter(CloneOperation operation)
     {
         return operation.PartitionsToClone.FirstOrDefault(p => p.IsSystemPartition)?.DriveLetter;
@@ -1531,6 +1631,17 @@ public class DiskClonerEngine
         if (string.IsNullOrWhiteSpace(path))
             return path;
         return path.EndsWith(@"\", StringComparison.Ordinal) ? path : path + @"\";
+    }
+
+    private static string ToRobocopyPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path;
+
+        // Robocopy expects standard DOS/UNC path syntax.
+        // Passing \\?\-prefixed paths (for example \\?\Z:\) causes ERROR 53
+        // in this workflow, so keep canonical non-extended syntax.
+        return path.Trim();
     }
 
     private void EnsureTargetDiskMutationAllowed(CloneOperation operation, int diskNumber, string operationName)
@@ -1608,8 +1719,16 @@ public class DiskClonerEngine
         throw new InvalidOperationException("No free drive letter available for target partition mounting.");
     }
 
-    private async Task<string> MigratePartitionFileSystemAsync(CloneOperation operation, PartitionInfo partition, CloneResult result)
+    private async Task<long> MigratePartitionFileSystemAsync(
+        CloneOperation operation,
+        PartitionInfo partition,
+        CloneResult result,
+        CloneProgress progress,
+        long totalBytesAlreadyCopied,
+        long migrationPlannedBytes)
     {
+        _cancellationTokenSource.Token.ThrowIfCancellationRequested();
+
         if (!partition.DriveLetter.HasValue)
             throw new InvalidOperationException($"Cannot migrate partition {partition.PartitionNumber}: source drive letter is missing.");
         if (partition.TargetPartitionNumber <= 0)
@@ -1617,7 +1736,7 @@ public class DiskClonerEngine
 
         EnsureTargetDiskMutationAllowed(operation, operation.TargetDisk.DiskNumber, "filesystem migration");
 
-        var sourceRoot = GetMigrationSourceRoot(operation, partition, result);
+        var sourceRoot = await GetMigrationSourceRootAsync(operation, partition, result);
         var targetLetter = GetAvailableDriveLetter('W', 'V', 'T', 'R', 'Q');
         EnsureTargetVolumeMutationAllowed(operation, targetLetter, "filesystem migration target mount");
 
@@ -1626,7 +1745,14 @@ public class DiskClonerEngine
         char? efiLetter = null;
         try
         {
-            await CopyWithRoboCopyAsync(sourceRoot, $"{targetLetter}:\\");
+            _cancellationTokenSource.Token.ThrowIfCancellationRequested();
+            var migratedBytes = await CopyWithRoboCopyAsync(
+                sourceRoot,
+                $"{targetLetter}:\\",
+                progress,
+                totalBytesAlreadyCopied,
+                migrationPlannedBytes,
+                targetLetter);
             await ValidateTargetVolumeAsync(targetLetter, "NTFS", operation, partition);
 
             var efi = operation.PartitionsToClone.FirstOrDefault(p => p.IsEfiPartition);
@@ -1637,6 +1763,8 @@ public class DiskClonerEngine
                 await MountExistingTargetPartitionAsync(operation, efi.TargetPartitionNumber, efiLetter.Value);
                 await RebuildBootFilesAsync(operation, targetLetter, efiLetter.Value);
             }
+
+            return migratedBytes;
         }
         finally
         {
@@ -1646,11 +1774,9 @@ public class DiskClonerEngine
             }
             await UnmountTargetPartitionAsync(operation, targetLetter);
         }
-
-        return $"{targetLetter}:\\";
     }
 
-    private string GetMigrationSourceRoot(CloneOperation operation, PartitionInfo partition, CloneResult result)
+    private async Task<string> GetMigrationSourceRootAsync(CloneOperation operation, PartitionInfo partition, CloneResult result)
     {
         var sourceRoot = $@"{partition.DriveLetter.Value}:\";
         if (!operation.UseSnapshotForFileMigration)
@@ -1660,6 +1786,23 @@ public class DiskClonerEngine
         if (string.IsNullOrWhiteSpace(snapshot))
         {
             var warning = $"Snapshot path unavailable for {sourceRoot}; using live source volume for file migration.";
+            _logger.Warning(warning);
+            result.Warnings.Add(warning);
+            return sourceRoot;
+        }
+
+        // Robocopy does not reliably support GLOBALROOT shadow-copy device paths as source.
+        // Fall back to the live source volume to keep migration functional.
+        if (snapshot.StartsWith(@"\\?\GLOBALROOT\", StringComparison.OrdinalIgnoreCase))
+        {
+            var exposed = await _vssService.ExposeSnapshotVolumeAsync(sourceRoot);
+            if (!string.IsNullOrWhiteSpace(exposed))
+            {
+                _logger.Info($"Using exposed snapshot mount '{exposed}' for migration source {sourceRoot}");
+                return EnsureTrailingBackslash(exposed);
+            }
+
+            var warning = $"Snapshot path '{snapshot}' could not be exposed; using live source volume {sourceRoot} for migration.";
             _logger.Warning(warning);
             result.Warnings.Add(warning);
             return sourceRoot;
@@ -1783,25 +1926,206 @@ public class DiskClonerEngine
         }
     }
 
-    private async Task CopyWithRoboCopyAsync(string sourceRoot, string targetRoot)
+    private async Task<long> CopyWithRoboCopyAsync(
+        string sourceRoot,
+        string targetRoot,
+        CloneProgress progress,
+        long totalBytesAlreadyCopied,
+        long migrationPlannedBytes,
+        char targetLetter)
     {
         var startInfo = new System.Diagnostics.ProcessStartInfo
         {
             FileName = "robocopy.exe",
-            Arguments = $"\"{EnsureTrailingBackslash(sourceRoot)}\" \"{EnsureTrailingBackslash(targetRoot)}\" /MIR /COPYALL /DCOPY:DAT /R:2 /W:2 /XJ /SL /XF pagefile.sys hiberfil.sys swapfile.sys",
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
             RedirectStandardError = true
         };
+        startInfo.ArgumentList.Add(ToRobocopyPath(EnsureTrailingBackslash(sourceRoot)));
+        startInfo.ArgumentList.Add(ToRobocopyPath(EnsureTrailingBackslash(targetRoot)));
+        startInfo.ArgumentList.Add("/MIR");
+        // Use backup mode and skip audit-copy bit to avoid long retry stalls on protected system paths.
+        startInfo.ArgumentList.Add("/COPY:DATSO");
+        startInfo.ArgumentList.Add("/DCOPY:DAT");
+        startInfo.ArgumentList.Add("/ZB");
+        startInfo.ArgumentList.Add("/R:0");
+        startInfo.ArgumentList.Add("/W:0");
+        startInfo.ArgumentList.Add("/XJ");
+        startInfo.ArgumentList.Add("/SL");
+        startInfo.ArgumentList.Add("/XF");
+        startInfo.ArgumentList.Add("pagefile.sys");
+        startInfo.ArgumentList.Add("hiberfil.sys");
+        startInfo.ArgumentList.Add("swapfile.sys");
 
-        var (exitCode, output, error) = await RunProcessAsync(startInfo);
-        _logger.Info($"Robocopy output: {output}");
+        using var process = System.Diagnostics.Process.Start(startInfo)
+            ?? throw new IOException("Failed to start robocopy.exe");
+
+        var outputLock = new object();
+        var outputTail = new Queue<string>();
+        var errorTail = new Queue<string>();
+        const int maxCapturedTailLines = 500;
+        long outputLineCount = 0;
+        long stderrLineCount = 0;
+        long benignErrorZeroLineCount = 0;
+        long suspiciousStdoutErrorLineCount = 0;
+        long lastOutputTicksUtc = DateTime.UtcNow.Ticks;
+
+        static void EnqueueTail(Queue<string> queue, string line)
+        {
+            queue.Enqueue(line);
+            if (queue.Count > maxCapturedTailLines)
+                queue.Dequeue();
+        }
+
+        Task PumpStreamAsync(StreamReader reader, Queue<string> tail, bool isError)
+        {
+            return Task.Run(async () =>
+            {
+                while (true)
+                {
+                    var line = await reader.ReadLineAsync();
+                    if (line == null)
+                        break;
+
+                    lock (outputLock)
+                    {
+                        EnqueueTail(tail, line);
+                    }
+
+                    Interlocked.Exchange(ref lastOutputTicksUtc, DateTime.UtcNow.Ticks);
+                    if (isError)
+                    {
+                        var stderrIndex = Interlocked.Increment(ref stderrLineCount);
+                        if (stderrIndex <= 50 || stderrIndex % 200 == 0)
+                        {
+                            _logger.Warning($"Robocopy stderr: {line}");
+                        }
+
+                        continue;
+                    }
+
+                    Interlocked.Increment(ref outputLineCount);
+                    if (IsBenignRobocopyErrorZeroLine(line))
+                    {
+                        Interlocked.Increment(ref benignErrorZeroLineCount);
+                        continue;
+                    }
+
+                    if (IsSuspiciousRobocopyStdoutLine(line))
+                    {
+                        var suspiciousIndex = Interlocked.Increment(ref suspiciousStdoutErrorLineCount);
+                        if (suspiciousIndex <= 20 || suspiciousIndex % 100 == 0)
+                        {
+                            _logger.Warning($"Robocopy stdout: {line}");
+                        }
+                    }
+                }
+            });
+        }
+
+        var outputTask = PumpStreamAsync(process.StandardOutput, outputTail, isError: false);
+        var errorTask = PumpStreamAsync(process.StandardError, errorTail, isError: true);
+
+        var lastSampleAt = DateTime.UtcNow;
+        var baselineUsed = GetVolumeUsedBytes(targetLetter);
+        var lastObservedMigratedBytes = 0L;
+        var effectivePlannedBytes = Math.Max(1L, migrationPlannedBytes);
+        double? smoothedThroughput = null;
+        const double throughputSmoothingFactor = 0.20; // lower = smoother, slower to react
+        var lastGrowthAt = DateTime.UtcNow;
+        var lastNoGrowthWarningAt = DateTime.MinValue;
+
+        while (!process.HasExited)
+        {
+            if (_cancellationTokenSource.Token.IsCancellationRequested)
+            {
+                try { process.Kill(entireProcessTree: true); } catch { }
+                throw new OperationCanceledException("Operation was cancelled by user");
+            }
+
+            var now = DateTime.UtcNow;
+            var usedNow = GetVolumeUsedBytes(targetLetter);
+            var observedMigratedBytes = Math.Max(0L, usedNow - baselineUsed);
+            if (observedMigratedBytes > effectivePlannedBytes)
+            {
+                effectivePlannedBytes = observedMigratedBytes;
+            }
+
+            var projectedTotalBytes = totalBytesAlreadyCopied + observedMigratedBytes;
+            if (projectedTotalBytes > progress.TotalBytes)
+            {
+                progress.TotalBytes = projectedTotalBytes;
+            }
+
+            var deltaBytes = Math.Max(0L, observedMigratedBytes - lastObservedMigratedBytes);
+            var deltaSeconds = Math.Max(0.001d, (now - lastSampleAt).TotalSeconds);
+            var instantThroughput = deltaBytes / deltaSeconds;
+            smoothedThroughput = smoothedThroughput.HasValue
+                ? (throughputSmoothingFactor * instantThroughput) + ((1.0 - throughputSmoothingFactor) * smoothedThroughput.Value)
+                : instantThroughput;
+
+            if (observedMigratedBytes > lastObservedMigratedBytes)
+            {
+                lastGrowthAt = now;
+            }
+
+            var noGrowthDuration = now - lastGrowthAt;
+            var lastOutputAt = new DateTime(Interlocked.Read(ref lastOutputTicksUtc), DateTimeKind.Utc);
+            var noOutputDuration = now - lastOutputAt;
+
+            if (noGrowthDuration >= TimeSpan.FromSeconds(45) &&
+                now - lastNoGrowthWarningAt >= TimeSpan.FromSeconds(30))
+            {
+                _logger.Warning(
+                    $"Robocopy migration has no target byte growth for {noGrowthDuration.TotalSeconds:0}s " +
+                    $"(no output for {noOutputDuration.TotalSeconds:0}s). This usually means retries/ACL work on protected files.");
+                lastNoGrowthWarningAt = now;
+            }
+
+            progress.BytesCopied = Math.Min(progress.TotalBytes, totalBytesAlreadyCopied + observedMigratedBytes);
+            progress.ThroughputBytesPerSec = smoothedThroughput.Value;
+            progress.PercentComplete = Math.Min(99.9, (progress.BytesCopied * 100.0) / Math.Max(1, progress.TotalBytes));
+            var remainingBytes = Math.Max(0L, progress.TotalBytes - progress.BytesCopied);
+            progress.EstimatedTimeRemaining = CalculateSafeEta(remainingBytes, progress.ThroughputBytesPerSec);
+            progress.StatusMessage = noGrowthDuration >= TimeSpan.FromSeconds(20)
+                ? "Migrating Windows partition (robocopy in progress, processing protected files/metadata)..."
+                : "Migrating Windows partition (robocopy in progress)...";
+            ReportProgress(progress);
+
+            lastObservedMigratedBytes = observedMigratedBytes;
+            lastSampleAt = now;
+
+            await Task.Delay(1000, _cancellationTokenSource.Token);
+        }
+
+        await process.WaitForExitAsync();
+        await Task.WhenAll(outputTask, errorTask);
+        string output;
+        string error;
+        lock (outputLock)
+        {
+            output = string.Join(Environment.NewLine, outputTail);
+            error = string.Join(Environment.NewLine, errorTail);
+        }
+        var exitCode = process.ExitCode;
+        _logger.Info(
+            $"Robocopy finished. ExitCode={exitCode}, StdOutLines={outputLineCount}, " +
+            $"StdErrLines={stderrLineCount}, BenignError0Lines={benignErrorZeroLineCount}, " +
+            $"SuspiciousStdOutErrorLines={suspiciousStdoutErrorLineCount}");
+        _logger.Info($"Robocopy stdout tail ({maxCapturedTailLines} lines max): {output}");
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            _logger.Warning($"Robocopy stderr tail ({maxCapturedTailLines} lines max): {error}");
+        }
         // Robocopy uses bitmask style exit codes; 0-7 are success categories.
         if (exitCode > 7)
         {
             throw new IOException($"Robocopy migration failed with code {exitCode}. Error={error}");
         }
+
+        var finalObserved = Math.Max(lastObservedMigratedBytes, Math.Max(0L, GetVolumeUsedBytes(targetLetter) - baselineUsed));
+        return finalObserved;
     }
 
     private async Task ValidateTargetVolumeAsync(char targetLetter, string expectedFileSystem, CloneOperation operation, PartitionInfo partition)
@@ -1863,6 +2187,70 @@ public class DiskClonerEngine
         var normalized = NormalizeDriveLetter(driveLetter);
         return DriveInfo.GetDrives()
             .FirstOrDefault(d => !string.IsNullOrWhiteSpace(d.Name) && NormalizeDriveLetter(d.Name[0]) == normalized);
+    }
+
+    private static long GetVolumeUsedBytes(char driveLetter)
+    {
+        try
+        {
+            var volume = GetVolumeByDriveLetter(driveLetter);
+            if (volume == null || !volume.IsReady)
+                return 0;
+            return Math.Max(0L, volume.TotalSize - volume.AvailableFreeSpace);
+        }
+        catch
+        {
+            return 0;
+        }
+    }
+
+    private static TimeSpan CalculateSafeEta(long remainingBytes, double throughputBytesPerSec)
+    {
+        if (remainingBytes <= 0)
+            return TimeSpan.Zero;
+
+        if (throughputBytesPerSec <= 0 || double.IsNaN(throughputBytesPerSec) || double.IsInfinity(throughputBytesPerSec))
+            return TimeSpan.Zero;
+
+        var seconds = remainingBytes / throughputBytesPerSec;
+        if (seconds <= 0 || double.IsNaN(seconds))
+            return TimeSpan.Zero;
+
+        var maxSeconds = TimeSpan.MaxValue.TotalSeconds - 1;
+        if (double.IsInfinity(seconds) || seconds >= maxSeconds)
+            return TimeSpan.MaxValue;
+
+        return TimeSpan.FromSeconds(seconds);
+    }
+
+    private static bool IsBenignRobocopyErrorZeroLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return false;
+
+        // Robocopy may emit "ERROR 0 (0x00000000) Copying File ..." lines during normal
+        // multi-threaded copy output; these are noisy and not actual failures.
+        return line.Contains("ERROR 0 (0x00000000) Copying File", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsSuspiciousRobocopyStdoutLine(string line)
+    {
+        if (string.IsNullOrWhiteSpace(line))
+            return false;
+
+        var trimmed = line.TrimStart();
+        if (trimmed.StartsWith("ERROR:", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Canonical robocopy error header format.
+        if (RobocopyTimestampedErrorRegex.IsMatch(trimmed))
+            return true;
+
+        // Keep fallback checks for interleaved output lines where timestamp prefix is damaged.
+        return trimmed.Contains("ERROR 3 (0x00000003)", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Contains("ERROR 5 (0x00000005)", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Contains("ERROR 32 (0x00000020)", StringComparison.OrdinalIgnoreCase)
+            || trimmed.Contains("ERROR 123 (0x0000007B)", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task<bool> VerifyIntegrityAsync(CloneOperation operation, CloneProgress progress, IReadOnlyCollection<int>? excludedPartitionNumbers = null)
@@ -2197,6 +2585,48 @@ public class DiskClonerEngine
                 out bytesReturned,
                 IntPtr.Zero);
         });
+    }
+
+    /// <summary>
+    /// Takes target disk offline for raw physical disk writes.
+    /// </summary>
+    private async Task OfflineTargetDiskAsync(CloneOperation operation)
+    {
+        EnsureTargetDiskMutationAllowed(operation, operation.TargetDisk.DiskNumber, "offline target disk");
+        _logger.Info($"Taking target disk {operation.TargetDisk.DiskNumber} offline...");
+
+        var scriptPath = Path.GetTempFileName();
+        var scriptContent = new StringBuilder();
+        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
+        scriptContent.AppendLine("offline disk");
+
+        AssertDiskpartScriptTargetsOnlyTargetDisk(operation, scriptContent.ToString(), "offline target disk");
+        await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
+
+        try
+        {
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "diskpart.exe",
+                Arguments = $"/s \"{scriptPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            var (exitCode, output, error) = await RunProcessAsync(startInfo);
+            if (exitCode != 0)
+            {
+                throw new IOException($"diskpart offline failed with code {exitCode}. Output: {output}. Error: {error}");
+            }
+
+            _logger.Info("Target disk taken offline successfully");
+        }
+        finally
+        {
+            try { File.Delete(scriptPath); } catch { }
+        }
     }
 
     /// <summary>

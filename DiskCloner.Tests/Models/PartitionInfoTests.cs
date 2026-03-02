@@ -135,7 +135,7 @@ public class PartitionInfoTests
         Assert.Equal("1 GB", partition.SizeDisplay);
 
         partition.SizeBytes = 1500000000;
-        Assert.Equal("1.39 GB", partition.SizeDisplay);
+        Assert.Equal("1.4 GB", partition.SizeDisplay);
     }
 
     [Fact]

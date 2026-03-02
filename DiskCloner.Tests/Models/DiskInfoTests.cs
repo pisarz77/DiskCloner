@@ -18,8 +18,8 @@ public class DiskInfoTests
         Assert.Equal(string.Empty, disk.DiskId);
         Assert.Equal(0, disk.SizeBytes);
         Assert.Equal(0, disk.TotalSectors);
-        Assert.Equal(512, disk.LogicalSectorSize); // Default value
-        Assert.Equal(512, disk.PhysicalSectorSize); // Default value
+        Assert.Equal(0, disk.LogicalSectorSize);
+        Assert.Equal(0, disk.PhysicalSectorSize);
         Assert.False(disk.IsGpt);
         Assert.False(disk.IsSystemDisk);
         Assert.False(disk.IsOnline);
@@ -93,7 +93,7 @@ public class DiskInfoTests
         Assert.Equal("1 PB", disk.SizeDisplay);
 
         disk.SizeBytes = 1500000000;
-        Assert.Equal("1.39 GB", disk.SizeDisplay);
+        Assert.Equal("1.4 GB", disk.SizeDisplay);
     }
 
     [Fact]
@@ -122,8 +122,7 @@ public class DiskInfoTests
 
         // Assert
         Assert.Contains("Disk 0: Windows Boot Drive", result);
-        Assert.Contains("Size: 465.66 GB", result);
-        Assert.Contains("Sectors: 976,773,167", result);
+        Assert.Contains("Size: 465.76 GB (976,773,167 sectors)", result);
         Assert.Contains("Sector Size: Logical=512, Physical=512", result);
         Assert.Contains("Type: GPT", result);
         Assert.Contains("Bus: NVMe", result);

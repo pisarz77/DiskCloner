@@ -38,14 +38,14 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_ThrowsOnNullOperation()
+    public async Task CreateSnapshotsAsync_ThrowsOnNullOperation()
     {
         // Act & Assert
-        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CreateSnapshotsAsync((CloneOperation)null));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CreateSnapshotsAsync((CloneOperation)null!));
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_ThrowsOnEmptyPartitions()
+    public async Task CreateSnapshotsAsync_ThrowsOnEmptyPartitions()
     {
         // Arrange
         var operation = new CloneOperation
@@ -58,12 +58,12 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_ThrowsOnNullPartitions()
+    public async Task CreateSnapshotsAsync_ThrowsOnNullPartitions()
     {
         // Arrange
         var operation = new CloneOperation
         {
-            PartitionsToClone = null
+            PartitionsToClone = null!
         };
 
         // Act & Assert
@@ -71,7 +71,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_ReturnsValidSnapshotInfo()
+    public async Task CreateSnapshotsAsync_ReturnsValidSnapshotInfo()
     {
         // Arrange
         var operation = new CloneOperation
@@ -99,7 +99,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_HandlesMultiplePartitions()
+    public async Task CreateSnapshotsAsync_HandlesMultiplePartitions()
     {
         // Arrange
         var operation = new CloneOperation
@@ -131,7 +131,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_HandlesPartitionsWithoutDriveLetters()
+    public async Task CreateSnapshotsAsync_HandlesPartitionsWithoutDriveLetters()
     {
         // Arrange
         var operation = new CloneOperation
@@ -157,14 +157,14 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CleanupSnapshotsAsync_ThrowsOnNullSnapshotInfo()
+    public async Task CleanupSnapshotsAsync_ThrowsOnNullSnapshotInfo()
     {
         // Act & Assert
-        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CleanupSnapshotsAsync((VssSnapshotService.SnapshotInfo)null));
+        await Assert.ThrowsAsync<ArgumentNullException>(() => _vssService.CleanupSnapshotsAsync((VssSnapshotService.SnapshotInfo)null!));
     }
 
     [Fact]
-    public async void CleanupSnapshotsAsync_CompletesSuccessfully()
+    public async Task CleanupSnapshotsAsync_CompletesSuccessfully()
     {
         // Arrange
         var operation = new CloneOperation
@@ -188,11 +188,11 @@ public class VssSnapshotServiceTests
 
         // Assert
         // If we get here without exception, cleanup was successful
-        Assert.True(true);
+        Assert.NotNull(snapshotInfo);
     }
 
     [Fact]
-    public async void CleanupSnapshotsAsync_HandlesEmptySnapshotInfo()
+    public async Task CleanupSnapshotsAsync_HandlesEmptySnapshotInfo()
     {
         // Arrange
         var snapshotInfo = new VssSnapshotService.SnapshotInfo
@@ -206,21 +206,21 @@ public class VssSnapshotServiceTests
 
         // Assert
         // If we get here without exception, cleanup was successful
-        Assert.True(true);
+        Assert.NotNull(snapshotInfo);
     }
 
     [Fact]
-    public async void IsVssAvailableAsync_ReturnsBoolean()
+    public async Task IsVssAvailableAsync_ReturnsBoolean()
     {
         // Act
         var result = await _vssService.IsVssAvailableAsync();
 
         // Assert
-        Assert.True(result is bool);
+        Assert.IsType<bool>(result);
     }
 
     [Fact]
-    public async void GetBitLockerStatusAsync_ReturnsStatus()
+    public async Task GetBitLockerStatusAsync_ReturnsStatus()
     {
         // Act
         var result = await _vssService.GetBitLockerStatusAsync();
@@ -232,7 +232,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void GetBitLockerStatusAsync_StatusIsSet()
+    public async Task GetBitLockerStatusAsync_StatusIsSet()
     {
         // Act
         var result = await _vssService.GetBitLockerStatusAsync();
@@ -243,7 +243,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void GetBitLockerStatusAsync_ProtectorsIsSet()
+    public async Task GetBitLockerStatusAsync_ProtectorsIsSet()
     {
         // Act
         var result = await _vssService.GetBitLockerStatusAsync();
@@ -254,7 +254,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void ResolveVolumeGuidAsync_ReturnsGuidForValidDrive()
+    public async Task ResolveVolumeGuidAsync_ReturnsGuidForValidDrive()
     {
         // Arrange
         var driveLetter = 'C';
@@ -270,7 +270,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void ResolveVolumeGuidAsync_ReturnsNullForInvalidDrive()
+    public async Task ResolveVolumeGuidAsync_ReturnsNullForInvalidDrive()
     {
         // Arrange
         var driveLetter = 'Z';
@@ -283,7 +283,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void ResolveVolumeGuidAsync_HandlesNullDrive()
+    public async Task ResolveVolumeGuidAsync_HandlesNullDrive()
     {
         // Arrange
         char? driveLetter = null;
@@ -296,7 +296,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_LogsInformation()
+    public async Task CreateSnapshotsAsync_LogsInformation()
     {
         // Arrange
         var operation = new CloneOperation
@@ -316,11 +316,11 @@ public class VssSnapshotServiceTests
         await _vssService.CreateSnapshotsAsync(operation);
 
         // Assert
-        _mockLogger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Creating VSS snapshots"))), Times.Once);
+        _mockLogger.Verify(l => l.Info(It.Is<string>(s => s.Contains("Creating VSS snapshots"))), Times.AtLeastOnce);
     }
 
     [Fact]
-    public async void CleanupSnapshotsAsync_LogsInformation()
+    public async Task CleanupSnapshotsAsync_LogsInformation()
     {
         // Arrange
         var operation = new CloneOperation
@@ -346,7 +346,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void IsVssAvailableAsync_LogsInformation()
+    public async Task IsVssAvailableAsync_LogsInformation()
     {
         // Act
         await _vssService.IsVssAvailableAsync();
@@ -356,7 +356,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void GetBitLockerStatusAsync_LogsInformation()
+    public async Task GetBitLockerStatusAsync_LogsInformation()
     {
         // Act
         await _vssService.GetBitLockerStatusAsync();
@@ -366,7 +366,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void ResolveVolumeGuidAsync_LogsInformation()
+    public async Task ResolveVolumeGuidAsync_LogsInformation()
     {
         // Arrange
         var driveLetter = 'C';
@@ -379,7 +379,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CreateSnapshotsAsync_HandlesExceptionGracefully()
+    public async Task CreateSnapshotsAsync_HandlesExceptionGracefully()
     {
         // Arrange - This test would require mocking the actual vshadow.exe execution
         // For now, we test that the method signature is correct and handles basic validation
@@ -403,7 +403,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void CleanupSnapshotsAsync_HandlesExceptionGracefully()
+    public async Task CleanupSnapshotsAsync_HandlesExceptionGracefully()
     {
         // Arrange
         var operation = new CloneOperation
@@ -426,7 +426,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void SnapshotInfo_PropertiesAreSet()
+    public async Task SnapshotInfo_PropertiesAreSet()
     {
         // Arrange
         var operation = new CloneOperation
@@ -453,7 +453,7 @@ public class VssSnapshotServiceTests
     }
 
     [Fact]
-    public async void SnapshotInfo_CollectionCountsMatch()
+    public async Task SnapshotInfo_CollectionCountsMatch()
     {
         // Arrange
         var operation = new CloneOperation

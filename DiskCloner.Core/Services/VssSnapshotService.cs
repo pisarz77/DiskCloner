@@ -14,6 +14,8 @@ public class VssSnapshotService : IDisposable
 {
     private readonly ILogger _logger;
     private readonly Dictionary<string, string> _snapshotVolumes = new();
+    private readonly Dictionary<string, Guid> _snapshotIdsByVolume = new();
+    private readonly Dictionary<string, string> _exposedPathsByVolume = new();
     private IVssBackupComponents? _backupComponents;
     private Guid _snapshotSetId = Guid.Empty;
     private bool _disposed;
@@ -64,7 +66,8 @@ public class VssSnapshotService : IDisposable
                 _backupComponents = vssFactory.CreateVssBackupComponents();
                 
                 _backupComponents.InitializeForBackup(null);
-                _backupComponents.SetContext(VssSnapshotContext.Backup);
+                // AppRollback creates a persistent software snapshot that can be exposed locally.
+                _backupComponents.SetContext(VssSnapshotContext.AppRollback);
                 _backupComponents.SetBackupState(false, true, VssBackupType.Full, false);
 
                 _snapshotSetId = _backupComponents.StartSnapshotSet();
@@ -100,9 +103,12 @@ public class VssSnapshotService : IDisposable
                 {
                     var props = _backupComponents.GetSnapshotProperties(volumeToSnapshot.Value);
                     var snapshotDeviceName = props.SnapshotDeviceObject;
-                    
+                    _logger.Debug($"Snapshot attributes for {volumeToSnapshot.Key}: {props.SnapshotAttributes}");
+
+                    var normalizedVolume = NormalizeVolumePath(volumeToSnapshot.Key);
                     result[volumeToSnapshot.Key] = snapshotDeviceName;
-                    _snapshotVolumes[volumeToSnapshot.Key] = snapshotDeviceName;
+                    _snapshotVolumes[normalizedVolume] = snapshotDeviceName;
+                    _snapshotIdsByVolume[normalizedVolume] = volumeToSnapshot.Value;
                     
                     _logger.Info($"Created snapshot for {volumeToSnapshot.Key} -> {snapshotDeviceName}");
                 }
@@ -286,6 +292,49 @@ public class VssSnapshotService : IDisposable
     }
 
     /// <summary>
+    /// Exposes a snapshot for a given original volume to a temporary local mount path.
+    /// Returns the exposed mount path (e.g., C:\Users\...\Temp\DiskCloner\VssMounts\...\),
+    /// or null if no snapshot is available for the given volume.
+    /// </summary>
+    public async Task<string?> ExposeSnapshotVolumeAsync(string originalVolume)
+    {
+        var normalized = NormalizeVolumePath(originalVolume);
+        if (!_snapshotIdsByVolume.TryGetValue(normalized, out var snapshotId))
+            return null;
+
+        if (_exposedPathsByVolume.TryGetValue(normalized, out var existingPath))
+            return EnsureTrailingBackslash(existingPath);
+
+        if (_backupComponents == null)
+            return null;
+
+        return await Task.Run(() =>
+        {
+            var exposeLetter = GetAvailableDriveLetter();
+            var exposeName = $"{exposeLetter}:\\";
+
+            try
+            {
+                _backupComponents.ExposeSnapshot(
+                    snapshotId,
+                    null!,
+                    VssVolumeSnapshotAttributes.ExposedLocally,
+                    exposeName);
+
+                var exposedPath = exposeName;
+                _exposedPathsByVolume[normalized] = exposedPath;
+                _logger.Info($"Exposed snapshot {snapshotId} for {normalized} at {exposedPath}");
+                return exposedPath;
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"Failed to expose snapshot {snapshotId} for {normalized} as {exposeName}: {ex.Message}");
+                return (string?)null;
+            }
+        });
+    }
+
+    /// <summary>
     /// Deletes all created snapshots.
     /// </summary>
     public async Task DeleteSnapshotsAsync()
@@ -302,6 +351,31 @@ public class VssSnapshotService : IDisposable
             {
                 try
                 {
+                    // Best-effort cleanup of exposed paths before deleting snapshot set.
+                    foreach (var exposed in _exposedPathsByVolume.Keys.ToList())
+                    {
+                        if (_snapshotIdsByVolume.TryGetValue(exposed, out var snapshotId))
+                        {
+                            try
+                            {
+                                _backupComponents.UnexposeSnapshot(snapshotId);
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.Warning($"Failed to unexpose snapshot {snapshotId}: {ex.Message}");
+                            }
+                        }
+                    }
+
+                    foreach (var mountPath in _exposedPathsByVolume.Values.Distinct().ToList())
+                    {
+                        // Exposed snapshot may be a drive letter (e.g. X:\), never delete that as a directory.
+                        if (!mountPath.Contains(":\\", StringComparison.Ordinal))
+                        {
+                            try { if (Directory.Exists(mountPath)) Directory.Delete(mountPath, true); } catch { }
+                        }
+                    }
+
                     _backupComponents.BackupComplete();
                     _backupComponents.DeleteSnapshotSet(_snapshotSetId, true);
                     _logger.Info("VSS snapshot set deleted successfully");
@@ -316,6 +390,8 @@ public class VssSnapshotService : IDisposable
                     _backupComponents = null;
                     _snapshotSetId = Guid.Empty;
                     _snapshotVolumes.Clear();
+                    _snapshotIdsByVolume.Clear();
+                    _exposedPathsByVolume.Clear();
                 }
             });
         }
@@ -449,5 +525,28 @@ public class VssSnapshotService : IDisposable
         {
             _logger.Error("Error during disposal", ex);
         }
+    }
+
+    private static string EnsureTrailingBackslash(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return path;
+        return path.EndsWith(@"\", StringComparison.Ordinal) ? path : path + @"\";
+    }
+
+    private static char GetAvailableDriveLetter()
+    {
+        var usedLetters = DriveInfo.GetDrives()
+            .Where(d => !string.IsNullOrWhiteSpace(d.Name))
+            .Select(d => char.ToUpperInvariant(d.Name[0]))
+            .ToHashSet();
+
+        for (char letter = 'Z'; letter >= 'M'; letter--)
+        {
+            if (!usedLetters.Contains(letter))
+                return letter;
+        }
+
+        throw new IOException("No free drive letter available to expose VSS snapshot.");
     }
 }

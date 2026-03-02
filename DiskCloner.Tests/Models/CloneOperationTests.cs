@@ -168,9 +168,9 @@ public class CloneProgressTests
         };
 
         // Act & Assert
-        Assert.Equal("1.39 GB", progress.BytesCopiedDisplay);
-        Assert.Equal("4.65 GB", progress.TotalBytesDisplay);
-        Assert.Equal("116.41 MB/s", progress.ThroughputDisplay);
+        Assert.Equal("1.4 GB", progress.BytesCopiedDisplay);
+        Assert.Equal("4.66 GB", progress.TotalBytesDisplay);
+        Assert.Equal("119.21 MB/s", progress.ThroughputDisplay);
     }
 
     [Fact]

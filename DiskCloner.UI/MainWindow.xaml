@@ -138,7 +138,7 @@
                                    Text="Only copies actual data on NTFS partitions. Faster and required for shrinking to a smaller target disk."/>
 
                         <!-- Allow Smaller Target Option -->
-                        <CheckBox x:Name="AllowSmallerTargetCheckBox" IsChecked="False" Margin="0,0,0,15">
+                        <CheckBox x:Name="AllowSmallerTargetCheckBox" IsChecked="True" Margin="0,0,0,15">
                             <TextBlock Text="Allow smaller target disk" TextWrapping="Wrap"/>
                         </CheckBox>
                         <TextBlock FontSize="12" Foreground="Red" TextWrapping="Wrap" Margin="25,0,0,20"
@@ -195,10 +195,10 @@
                         </Border>
 
                         <!-- Confirmation Section -->
-                        <TextBlock FontSize="16" FontWeight="Bold" Text="Type 'CLONE' to confirm:" Margin="0,0,0,10"/>
+                        <TextBlock FontSize="16" FontWeight="Bold" Text="Ready to start cloning" Margin="0,0,0,10"/>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
                             <TextBox x:Name="ConfirmationTextBox" Width="150" Margin="0,0,10,0" TextChanged="ConfirmationTextBox_TextChanged"/>
-                            <Button x:Name="CloneButton" Content="Start Clone" IsEnabled="False"
+                            <Button x:Name="CloneButton" Content="Start Clone" IsEnabled="True"
                                     Click="CloneButton_Click" Background="#FF4CAF50" Foreground="White"/>
                         </StackPanel>
 

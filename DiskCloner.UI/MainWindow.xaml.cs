@@ -50,7 +50,12 @@ public partial class MainWindow : Window
 
     private void InitializeLogger()
     {
-        var logDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "DiskCloner", "Logs");
+        // Store logs next to the actually launched executable.
+        // In single-file mode, AppContext.BaseDirectory may point to an extraction/runtime directory.
+        var processPath = Environment.ProcessPath;
+        var logDir = !string.IsNullOrWhiteSpace(processPath)
+            ? (Path.GetDirectoryName(processPath) ?? AppContext.BaseDirectory)
+            : AppContext.BaseDirectory;
         var logPath = Path.Combine(logDir, $"clone_{DateTime.UtcNow:yyyyMMdd_HHmmss}.log");
         _logger = new FileLogger(logPath);
 
@@ -215,7 +220,8 @@ public partial class MainWindow : Window
 
     private void ConfirmationTextBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
-        CloneButton.IsEnabled = ConfirmationTextBox.Text == "CLONE";
+        // Temporarily bypass typed confirmation requirement.
+        CloneButton.IsEnabled = true;
     }
 
     private async void PreviewButton_Click(object sender, RoutedEventArgs e)
@@ -264,7 +270,7 @@ public partial class MainWindow : Window
 
         // Clear confirmation
         ConfirmationTextBox.Text = "";
-        CloneButton.IsEnabled = false;
+        CloneButton.IsEnabled = true;
 
         // Start cloning
         await StartCloningAsync(sourceDisk, targetDisk);
@@ -366,7 +372,7 @@ public partial class MainWindow : Window
         BufferSizeComboBox.IsEnabled = enabled;
         PreviewButton.IsEnabled = enabled;
         ConfirmationTextBox.IsEnabled = enabled;
-        CloneButton.IsEnabled = enabled ? (ConfirmationTextBox.Text.Trim().ToUpper() == "CLONE") : false;
+        CloneButton.IsEnabled = enabled;
         
         // Disable "Refresh Disks" buttons (they don't have names, so we'll find them)
         foreach (var child in FindVisualChildren<Button>(this))

@@ -29,7 +29,13 @@ public class FileLogger : ILogger
             Directory.CreateDirectory(directory);
         }
 
-        _writer = new StreamWriter(logFilePath, append: false, Encoding.UTF8)
+        var stream = new FileStream(
+            logFilePath,
+            FileMode.Create,
+            FileAccess.Write,
+            FileShare.ReadWrite);
+
+        _writer = new StreamWriter(stream, Encoding.UTF8)
         {
             AutoFlush = true
         };

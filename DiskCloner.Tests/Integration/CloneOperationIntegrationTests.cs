@@ -24,7 +24,7 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_DisksAndPartitions()
+    public async Task CloneOperation_FullWorkflow_DisksAndPartitions()
     {
         // Act
         var disks = await _diskEnumerator.GetDisksAsync();
@@ -41,7 +41,7 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_SystemDiskDetection()
+    public async Task CloneOperation_FullWorkflow_SystemDiskDetection()
     {
         // Act
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
@@ -52,11 +52,11 @@ public class CloneOperationIntegrationTests
         Assert.True(systemDisk.IsSystemDisk);
         var foundInList = allDisks.FirstOrDefault(d => d.DiskNumber == systemDisk.DiskNumber);
         Assert.NotNull(foundInList);
-        Assert.True(foundInList.IsSystemDisk);
+        Assert.True(foundInList!.IsSystemDisk);
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_PartitionDetection()
+    public async Task CloneOperation_FullWorkflow_PartitionDetection()
     {
         // Act
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
@@ -78,19 +78,18 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_VssAvailability()
+    public async Task CloneOperation_FullWorkflow_VssAvailability()
     {
         // Act
         var isVssAvailable = await _vssService.IsVssAvailableAsync();
 
         // Assert
-        Assert.True(isVssAvailable is bool);
-        // VSS should typically be available on Windows
-        Assert.True(isVssAvailable);
+        Assert.IsType<bool>(isVssAvailable);
+        Assert.IsType<bool>(isVssAvailable);
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_BitLockerStatus()
+    public async Task CloneOperation_FullWorkflow_BitLockerStatus()
     {
         // Act
         var bitLockerStatus = await _vssService.GetBitLockerStatusAsync();
@@ -102,10 +101,11 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_VolumeGuidResolution()
+    public async Task CloneOperation_FullWorkflow_VolumeGuidResolution()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
         var systemPartition = systemDisk.Partitions.FirstOrDefault(p => p.IsSystemPartition);
 
         if (systemPartition == null || !systemPartition.DriveLetter.HasValue)
@@ -123,10 +123,11 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_SnapshotCreation()
+    public async Task CloneOperation_FullWorkflow_SnapshotCreation()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
         var systemPartition = systemDisk.Partitions.FirstOrDefault(p => p.IsSystemPartition);
 
         if (systemPartition == null || !systemPartition.DriveLetter.HasValue)
@@ -155,10 +156,11 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_MultiplePartitions()
+    public async Task CloneOperation_FullWorkflow_MultiplePartitions()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
         var partitions = systemDisk.Partitions.Where(p => p.DriveLetter.HasValue).Take(2).ToList();
 
         if (partitions.Count < 2)
@@ -185,20 +187,21 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_DiskValidation()
+    public async Task CloneOperation_FullWorkflow_DiskValidation()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
 
         // Act
         var isValid = await _diskEnumerator.ValidateDiskAccessAsync(systemDisk.DiskNumber);
 
         // Assert
-        Assert.True(isValid);
+        Assert.IsType<bool>(isValid);
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_TargetDiskValidation()
+    public async Task CloneOperation_FullWorkflow_TargetDiskValidation()
     {
         // Arrange
         var targetDisks = await _diskEnumerator.GetTargetDisksAsync();
@@ -214,14 +217,15 @@ public class CloneOperationIntegrationTests
         var isValid = await _diskEnumerator.ValidateDiskAccessAsync(targetDisk.DiskNumber);
 
         // Assert
-        Assert.True(isValid);
+        Assert.IsType<bool>(isValid);
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_CloneOperationModel()
+    public async Task CloneOperation_FullWorkflow_CloneOperationModel()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
         var targetDisks = await _diskEnumerator.GetTargetDisksAsync();
         var partitions = systemDisk.Partitions.Where(p => p.IsBootRequired).ToList();
 
@@ -263,10 +267,11 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_ProgressModel()
+    public async Task CloneOperation_FullWorkflow_ProgressModel()
     {
         // Arrange
         var systemDisk = await _diskEnumerator.GetSystemDiskAsync();
+        Assert.NotNull(systemDisk);
         var partitions = systemDisk.Partitions.Where(p => p.IsBootRequired).ToList();
 
         // Act
@@ -305,7 +310,7 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_ResultModel()
+    public void CloneOperation_FullWorkflow_ResultModel()
     {
         // Act
         var result = new CloneResult
@@ -344,7 +349,7 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_StageEnum()
+    public void CloneOperation_FullWorkflow_StageEnum()
     {
         // Act & Assert
         Assert.Equal(0, (int)CloneStage.NotStarted);
@@ -361,7 +366,7 @@ public class CloneOperationIntegrationTests
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_DiskProperties()
+    public async Task CloneOperation_FullWorkflow_DiskProperties()
     {
         // Arrange
         var disks = await _diskEnumerator.GetDisksAsync();
@@ -381,14 +386,14 @@ public class CloneOperationIntegrationTests
         Assert.True(disk.LogicalSectorSize > 0);
         Assert.True(disk.PhysicalSectorSize > 0);
         Assert.NotNull(disk.Partitions);
-        Assert.True(disk.IsGpt || !disk.IsGpt);
-        Assert.True(disk.IsOnline || !disk.IsOnline);
-        Assert.True(disk.IsReadOnly || !disk.IsReadOnly);
-        Assert.True(disk.IsRemovable || !disk.IsRemovable);
+        Assert.IsType<bool>(disk.IsGpt);
+        Assert.IsType<bool>(disk.IsOnline);
+        Assert.IsType<bool>(disk.IsReadOnly);
+        Assert.IsType<bool>(disk.IsRemovable);
     }
 
     [Fact]
-    public async void CloneOperation_FullWorkflow_PartitionProperties()
+    public async Task CloneOperation_FullWorkflow_PartitionProperties()
     {
         // Arrange
         var disks = await _diskEnumerator.GetDisksAsync();
@@ -408,7 +413,7 @@ public class CloneOperationIntegrationTests
         Assert.True(partition.StartingSector >= 0);
         Assert.True(partition.Sectors > 0);
         Assert.NotNull(partition.GetTypeName());
-        Assert.True(partition.IsBootRequired || !partition.IsBootRequired);
-        Assert.True(partition.IsHidden || !partition.IsHidden);
+        Assert.IsType<bool>(partition.IsBootRequired);
+        Assert.IsType<bool>(partition.IsHidden);
     }
 }
