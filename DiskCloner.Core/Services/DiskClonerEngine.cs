@@ -851,6 +851,25 @@ public class DiskClonerEngine
                     // Ensure write size is sector-aligned
                     uint bytesToWrite = ((bytesRead + (uint)sectorSize - 1) / (uint)sectorSize) * (uint)sectorSize;
 
+                    // If the read returned a non-sector-aligned amount, zero-pad the remainder
+                    // in the native buffer so we don't write stale memory to the target disk.
+                    if (bytesToWrite > bytesRead)
+                    {
+                        var pad = (int)(bytesToWrite - bytesRead);
+                        try
+                        {
+                            var dest = IntPtr.Add(nativeBuffer, (int)bytesRead);
+                            for (int zi = 0; zi < pad; zi++)
+                            {
+                                Marshal.WriteByte(dest, zi, 0);
+                            }
+                        }
+                        catch (OverflowException)
+                        {
+                            throw new IOException($"Buffer padding overflow while preparing write of {bytesToWrite} bytes (read {bytesRead}).");
+                        }
+                    }
+
                     // Seek to target position
                     if (!WindowsApi.SetFilePointerEx(targetHandle, absoluteTargetOffset, out _, WindowsApi.FILE_BEGIN))
                     {
@@ -1404,30 +1423,35 @@ public class DiskClonerEngine
             progress.CurrentPartitionName = $"Verifying {partition.GetTypeName()}";
             ReportProgress(progress);
 
-            using var sha256 = SHA256.Create();
             var sourceOffset = partition.StartingOffset;
             var targetOffset = GetRequiredTargetStartingOffset(partition);
 
-            // Read and hash source
-            var sourceHash = await ComputeHashAsync(
-                operation.SourceDisk.DiskNumber,
-                sourceOffset,
-                partition.TargetSizeBytes,
-                bufferSize,
-                sha256);
-
-            // Read and hash target
-            var targetHash = await ComputeHashAsync(
-                operation.TargetDisk.DiskNumber,
-                targetOffset,
-                partition.TargetSizeBytes,
-                bufferSize,
-                sha256);
-
-            if (!sourceHash.SequenceEqual(targetHash))
+            // Read and hash source (use independent SHA instances for source and target)
+            using (var srcSha = SHA256.Create())
             {
-                _logger.Error($"Hash mismatch for partition {partition.PartitionNumber}");
-                return false;
+                var sourceHash = await ComputeHashAsync(
+                    operation.SourceDisk.DiskNumber,
+                    sourceOffset,
+                    partition.TargetSizeBytes,
+                    bufferSize,
+                    srcSha);
+
+                // Read and hash target with a separate SHA instance
+                using (var tgtSha = SHA256.Create())
+                {
+                    var targetHash = await ComputeHashAsync(
+                        operation.TargetDisk.DiskNumber,
+                        targetOffset,
+                        partition.TargetSizeBytes,
+                        bufferSize,
+                        tgtSha);
+
+                    if (!sourceHash.SequenceEqual(targetHash))
+                    {
+                        _logger.Error($"Hash mismatch for partition {partition.PartitionNumber}");
+                        return false;
+                    }
+                }
             }
 
             totalChecked += partition.TargetSizeBytes;
@@ -1479,26 +1503,29 @@ public class DiskClonerEngine
                 var sampleSize = Math.Min(bufferSize,
                     sourcePartitionOffset + partition.TargetSizeBytes - sourceSampleOffset);
 
-                using var sha256 = SHA256.Create();
-
-                var sourceHash = await ComputeHashAsync(
-                    operation.SourceDisk.DiskNumber,
-                    sourceSampleOffset,
-                    sampleSize,
-                    (int)sampleSize,
-                    sha256);
-
-                var targetHash = await ComputeHashAsync(
-                    operation.TargetDisk.DiskNumber,
-                    targetSampleOffset,
-                    sampleSize,
-                    (int)sampleSize,
-                    sha256);
-
-                if (!sourceHash.SequenceEqual(targetHash))
+                // Use separate hash instances for source and target samples
+                using (var srcSha = SHA256.Create())
+                using (var tgtSha = SHA256.Create())
                 {
-                    _logger.Error($"Hash mismatch for partition {partition.PartitionNumber} at sample {i}");
-                    return false;
+                    var sourceHash = await ComputeHashAsync(
+                        operation.SourceDisk.DiskNumber,
+                        sourceSampleOffset,
+                        sampleSize,
+                        (int)sampleSize,
+                        srcSha);
+
+                    var targetHash = await ComputeHashAsync(
+                        operation.TargetDisk.DiskNumber,
+                        targetSampleOffset,
+                        sampleSize,
+                        (int)sampleSize,
+                        tgtSha);
+
+                    if (!sourceHash.SequenceEqual(targetHash))
+                    {
+                        _logger.Error($"Hash mismatch for partition {partition.PartitionNumber} at sample {i}");
+                        return false;
+                    }
                 }
 
                 samplesChecked++;

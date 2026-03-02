@@ -370,4 +370,7 @@ public class TestLogger : ILogger
     public void Error(string message) => Console.WriteLine($"[ERROR] {message}");
     public void Error(string message, Exception ex) => Console.WriteLine($"[ERROR] {message}: {ex.Message}");
     public void Debug(string message) => Console.WriteLine($"[DEBUG] {message}");
+    public IReadOnlyList<LogEntry> GetLogEntries() => Array.Empty<LogEntry>();
+    public void Clear() { }
+    public void Dispose() { }
 }
