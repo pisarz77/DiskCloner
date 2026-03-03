@@ -138,7 +138,7 @@
                                    Text="Only copies actual data on NTFS partitions. Faster and required for shrinking to a smaller target disk."/>
 
                         <!-- Allow Smaller Target Option -->
-                        <CheckBox x:Name="AllowSmallerTargetCheckBox" IsChecked="True" Margin="0,0,0,15">
+                        <CheckBox x:Name="AllowSmallerTargetCheckBox" IsChecked="False" Margin="0,0,0,15">
                             <TextBlock Text="Allow smaller target disk" TextWrapping="Wrap"/>
                         </CheckBox>
                         <TextBlock FontSize="12" Foreground="Red" TextWrapping="Wrap" Margin="25,0,0,20"
@@ -196,25 +196,12 @@
 
                         <!-- Confirmation Section -->
                         <TextBlock FontSize="16" FontWeight="Bold" Text="Ready to start cloning" Margin="0,0,0,10"/>
+                        <TextBlock Text="Type CLONE to enable Start Clone" Margin="0,0,0,10" Foreground="#FFB71C1C"/>
                         <StackPanel Orientation="Horizontal" Margin="0,0,0,20">
                             <TextBox x:Name="ConfirmationTextBox" Width="150" Margin="0,0,10,0" TextChanged="ConfirmationTextBox_TextChanged"/>
-                            <Button x:Name="CloneButton" Content="Start Clone" IsEnabled="True"
+                            <Button x:Name="CloneButton" Content="Start Clone" IsEnabled="False"
                                     Click="CloneButton_Click" Background="#FF4CAF50" Foreground="White"/>
                         </StackPanel>
-
-                        <Border BorderBrush="#FF90A4AE" BorderThickness="1" Padding="12" Margin="0,0,0,20" Background="#FFF7FAFC">
-                            <StackPanel>
-                                <TextBlock FontSize="15" FontWeight="Bold" Text="Robocopy Failure Probe (fast diagnostics)" Margin="0,0,0,8"/>
-                                <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                                    <TextBlock Text="Max files:" Margin="0,0,8,0" VerticalAlignment="Center"/>
-                                    <TextBox x:Name="ProbeMaxFilesTextBox" Width="70" Text="40" Margin="0,0,12,0"/>
-                                    <Button x:Name="RunRobocopyProbeButton" Content="Probe Problem Files"
-                                            Click="RunRobocopyProbeButton_Click"
-                                            Background="#FF607D8B" Foreground="White"/>
-                                </StackPanel>
-                                <TextBlock x:Name="ProbeStatusTextBlock" Text="" Margin="0,8,0,0" Foreground="#FF37474F" TextWrapping="Wrap"/>
-                            </StackPanel>
-                        </Border>
 
                         <!-- Progress Section -->
                         <Border x:Name="ProgressBorder" BorderBrush="Gray" BorderThickness="1" Padding="20" Visibility="Collapsed">

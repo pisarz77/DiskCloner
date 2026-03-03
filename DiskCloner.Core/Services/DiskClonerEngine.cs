@@ -81,13 +81,17 @@ public class DiskClonerEngine
                 progress.StatusMessage = "Creating VSS snapshots for consistent data...";
                 ReportProgress(progress);
 
-                var volumesToSnapshot = operation.PartitionsToClone
-                    .Where(p => p.DriveLetter.HasValue)
-                    .Select(p => $@"{p.DriveLetter.Value}:\")
-                    .Distinct()
-                    .ToList();
+                var volumesToSnapshot = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var partition in operation.PartitionsToClone)
+                {
+                    if (!partition.DriveLetter.HasValue)
+                        continue;
 
-                await _vssService.CreateSnapshotsForVolumesAsync(volumesToSnapshot);
+                    var driveLetter = char.ToUpperInvariant(partition.DriveLetter.Value);
+                    volumesToSnapshot.Add($@"{driveLetter}:\");
+                }
+
+                await _vssService.CreateSnapshotsForVolumesAsync(volumesToSnapshot.ToList());
             }
 
             // Step 3: Prepare target disk
@@ -268,6 +272,11 @@ public class DiskClonerEngine
 
             // Step 7: Finalize and mark as bootable
             result.IsBootable = await MakeBootableAsync(operation);
+            if (!result.IsBootable)
+            {
+                throw new InvalidOperationException(
+                    "Boot finalization failed. Clone data was copied, but target boot preparation did not complete.");
+            }
 
             // Calculate final statistics
             result.Duration = DateTime.UtcNow - startTime;
@@ -312,6 +321,14 @@ public class DiskClonerEngine
 
             result.ErrorMessage = ex.Message;
             result.Exception = ex;
+            result.BootMode = operation.SourceDisk.IsGpt ? "UEFI" : "BIOS";
+            if (ex.Message.StartsWith("Boot finalization failed", StringComparison.OrdinalIgnoreCase))
+            {
+                result.NextSteps.Clear();
+                result.NextSteps.Add("Re-run clone to retry automated boot finalization.");
+                result.NextSteps.Add("If the issue persists, mount target Windows+EFI and run bcdboot manually.");
+                result.NextSteps.Add("Run chkdsk /f on target Windows volume before first boot.");
+            }
             return result;
         }
         finally
@@ -390,13 +407,17 @@ public class DiskClonerEngine
             throw new InvalidOperationException("System partition must be included");
 
         // Check for BitLocker
-        foreach (var partition in operation.PartitionsToClone.Where(p => p.DriveLetter.HasValue))
+        foreach (var partition in operation.PartitionsToClone)
         {
-            var isEncrypted = await _vssService.IsVolumeBitLockerEncrypted(partition.DriveLetter.Value);
+            if (!partition.DriveLetter.HasValue)
+                continue;
+
+            var driveLetter = partition.DriveLetter.Value;
+            var isEncrypted = await _vssService.IsVolumeBitLockerEncrypted(driveLetter);
             if (isEncrypted)
             {
-                _logger.Warning($"Partition {partition.DriveLetter}: is BitLocker encrypted");
-                progress.StatusMessage = $"Warning: Drive {partition.DriveLetter}: has BitLocker enabled";
+                _logger.Warning($"Partition {driveLetter}: is BitLocker encrypted");
+                progress.StatusMessage = $"Warning: Drive {driveLetter}: has BitLocker enabled";
                 ReportProgress(progress);
 
                 // In a real implementation, you would either:
@@ -2005,6 +2026,9 @@ public class DiskClonerEngine
 
     private async Task<string> GetMigrationSourceRootAsync(CloneOperation operation, PartitionInfo partition, CloneResult result)
     {
+        if (!partition.DriveLetter.HasValue)
+            throw new InvalidOperationException($"Cannot migrate partition {partition.PartitionNumber}: source drive letter is missing.");
+
         var sourceRoot = $@"{partition.DriveLetter.Value}:\";
         if (!operation.UseSnapshotForFileMigration)
             return sourceRoot;

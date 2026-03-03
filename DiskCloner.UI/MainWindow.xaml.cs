@@ -220,11 +220,10 @@ public partial class MainWindow : Window
 
     private void ConfirmationTextBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
-        // Temporarily bypass typed confirmation requirement.
-        CloneButton.IsEnabled = true;
+        UpdateCloneButtonState();
     }
 
-    private async void PreviewButton_Click(object sender, RoutedEventArgs e)
+    private void PreviewButton_Click(object sender, RoutedEventArgs e)
     {
         if (!ValidateSelection(out var sourceDisk, out var targetDisk))
             return;
@@ -251,6 +250,17 @@ public partial class MainWindow : Window
         if (!ValidateSelection(out var sourceDisk, out var targetDisk))
             return;
 
+        if (!string.Equals(ConfirmationTextBox.Text.Trim(), "CLONE", StringComparison.Ordinal))
+        {
+            MessageBox.Show(
+                "Type CLONE exactly to enable and start cloning.",
+                "Confirmation Required",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+            UpdateCloneButtonState();
+            return;
+        }
+
         // Final confirmation dialog
         var result = MessageBox.Show(
             "This is your LAST CHANCE to cancel.\n\n" +
@@ -270,7 +280,7 @@ public partial class MainWindow : Window
 
         // Clear confirmation
         ConfirmationTextBox.Text = "";
-        CloneButton.IsEnabled = true;
+        CloneButton.IsEnabled = false;
 
         // Start cloning
         await StartCloningAsync(sourceDisk, targetDisk);
@@ -321,6 +331,8 @@ public partial class MainWindow : Window
             _isCloning = false;
             _clonerEngine.ProgressUpdate -= OnProgressUpdate;
             SetInteractiveElementsEnabled(true);
+            ConfirmationTextBox.Text = "";
+            CloneButton.IsEnabled = false;
             // Always restore Cancel button when done
             CancelButton.IsEnabled = false;
             CancelButton.Content = "Cancel";
@@ -372,9 +384,14 @@ public partial class MainWindow : Window
         BufferSizeComboBox.IsEnabled = enabled;
         PreviewButton.IsEnabled = enabled;
         ConfirmationTextBox.IsEnabled = enabled;
-        CloneButton.IsEnabled = enabled;
-        RunRobocopyProbeButton.IsEnabled = enabled;
-        ProbeMaxFilesTextBox.IsEnabled = enabled;
+        if (enabled)
+        {
+            UpdateCloneButtonState();
+        }
+        else
+        {
+            CloneButton.IsEnabled = false;
+        }
         
         // Disable "Refresh Disks" buttons (they don't have names, so we'll find them)
         foreach (var child in FindVisualChildren<Button>(this))
@@ -386,171 +403,12 @@ public partial class MainWindow : Window
         }
     }
 
-    private async void RunRobocopyProbeButton_Click(object sender, RoutedEventArgs e)
+    private void UpdateCloneButtonState()
     {
-        if (_isCloning)
-        {
-            MessageBox.Show("Cannot run diagnostics while clone is in progress.", "Busy",
-                MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
-        }
-
-        if (!int.TryParse(ProbeMaxFilesTextBox.Text, out var maxFiles) || maxFiles <= 0)
-        {
-            MessageBox.Show("Invalid max files value. Enter a positive number.", "Validation Error",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
-        if (maxFiles > 300)
-            maxFiles = 300;
-
-        var logPath = ResolveProbeLogPath();
-        if (string.IsNullOrWhiteSpace(logPath) || !File.Exists(logPath))
-        {
-            MessageBox.Show("No readable clone log file found for diagnostics.", "Probe",
-                MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
-        var destinationRoot = Path.Combine(
-            Path.GetTempPath(),
-            "DiskCloner",
-            "RobocopyProbe",
-            DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
-
-        var fallbackDrive = GetSystemDriveLetter();
-        ProbeStatusTextBlock.Text = $"Running robocopy probe using log: {logPath}";
-        RunRobocopyProbeButton.IsEnabled = false;
-
-        try
-        {
-            var probeService = new RobocopyFailureProbeService(_logger!);
-            var probeResult = await probeService.ProbeFromLogAsync(
-                logPath,
-                destinationRoot,
-                maxFiles,
-                fallbackDrive);
-
-            ProbeStatusTextBlock.Text =
-                $"Probe completed. Tested {probeResult.FilesTested}, success {probeResult.SuccessCount}, failed {probeResult.FailureCount}.";
-
-            MessageBox.Show(
-                $"Robocopy probe finished.\n\n" +
-                $"Discovered: {probeResult.DiscoveredFailurePaths}\n" +
-                $"Tested: {probeResult.FilesTested}\n" +
-                $"Success: {probeResult.SuccessCount}\n" +
-                $"Failed: {probeResult.FailureCount}\n\n" +
-                $"Summary:\n{probeResult.SummaryFilePath}",
-                "Probe Result",
-                MessageBoxButton.OK,
-                probeResult.FailureCount == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
-        }
-        catch (Exception ex)
-        {
-            _logger?.Error("Robocopy probe failed", ex);
-            ProbeStatusTextBlock.Text = $"Probe failed: {ex.Message}";
-            MessageBox.Show($"Robocopy probe failed: {ex.Message}", "Probe Error",
-                MessageBoxButton.OK, MessageBoxImage.Error);
-        }
-        finally
-        {
-            RunRobocopyProbeButton.IsEnabled = true;
-        }
-    }
-
-    private string? ResolveProbeLogPath()
-    {
-        var candidates = EnumerateProbeLogCandidates()
-            .Distinct(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var candidate in candidates)
-        {
-            if (IsLogReadable(candidate))
-                return candidate;
-        }
-
-        return null;
-    }
-
-    private IEnumerable<string> EnumerateProbeLogCandidates()
-    {
-        if (_logger is FileLogger fileLogger && File.Exists(fileLogger.LogFilePath))
-            yield return fileLogger.LogFilePath;
-
-        var processPath = Environment.ProcessPath;
-        var baseDirectory = !string.IsNullOrWhiteSpace(processPath)
-            ? (Path.GetDirectoryName(processPath) ?? AppContext.BaseDirectory)
-            : AppContext.BaseDirectory;
-
-        foreach (var logPath in EnumerateLogsInDirectory(baseDirectory))
-            yield return logPath;
-
-        var publishRoot = Directory.GetParent(baseDirectory)?.FullName;
-        if (string.IsNullOrWhiteSpace(publishRoot) || !Directory.Exists(publishRoot))
-            yield break;
-
-        IEnumerable<string> publishDirs;
-        try
-        {
-            publishDirs = Directory.EnumerateDirectories(publishRoot, "publish_*", SearchOption.TopDirectoryOnly);
-        }
-        catch
-        {
-            yield break;
-        }
-
-        foreach (var publishDir in publishDirs)
-        {
-            foreach (var logPath in EnumerateLogsInDirectory(publishDir))
-                yield return logPath;
-        }
-    }
-
-    private static IEnumerable<string> EnumerateLogsInDirectory(string directoryPath)
-    {
-        if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath))
-            return Enumerable.Empty<string>();
-
-        try
-        {
-            return Directory.EnumerateFiles(directoryPath, "clone_*.log", SearchOption.TopDirectoryOnly)
-                .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
-                .ToArray();
-        }
-        catch
-        {
-            return Enumerable.Empty<string>();
-        }
-    }
-
-    private static bool IsLogReadable(string logPath)
-    {
-        if (string.IsNullOrWhiteSpace(logPath) || !File.Exists(logPath))
-            return false;
-
-        try
-        {
-            using var stream = new FileStream(
-                logPath,
-                FileMode.Open,
-                FileAccess.Read,
-                FileShare.ReadWrite | FileShare.Delete);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static char GetSystemDriveLetter()
-    {
-        var root = Path.GetPathRoot(Environment.SystemDirectory);
-        if (!string.IsNullOrWhiteSpace(root) && root.Length >= 2 && root[1] == ':')
-            return root[0];
-
-        return 'C';
+        CloneButton.IsEnabled =
+            !_isCloning &&
+            ConfirmationTextBox.IsEnabled &&
+            string.Equals(ConfirmationTextBox.Text.Trim(), "CLONE", StringComparison.Ordinal);
     }
 
     private static IEnumerable<T> FindVisualChildren<T>(DependencyObject depObj) where T : DependencyObject

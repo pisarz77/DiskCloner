@@ -37,9 +37,9 @@ This document outlines the test cases for the Disk Cloner application. Tests cov
 2. Verify auto-selection of system disk as source
 3. Select USB drive as target
 4. Verify all partitions are selected
-5. Use default options (VSS enabled, sampling verification)
+5. Use default options (VSS enabled, full verification)
 6. Generate and review preview
-7. Type "CLONE" to confirm
+7. Type `CLONE` exactly to confirm
 8. Monitor progress to completion
 9. Verify no errors in logs
 

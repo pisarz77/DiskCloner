@@ -46,10 +46,11 @@ dotnet build --configuration Release
 4. **Review Partitions**: Ensure all required partitions are selected
 5. **Configure Options**:
    - Enable VSS for consistent snapshots (recommended)
-   - Choose verification level (sampling is faster)
+   - Keep full verification enabled for maximum reliability
    - Enable automatic partition expansion
+   - "Allow smaller target disk" is OFF by default (enable only when needed)
 6. **Preview**: Review the operation summary
-7. **Confirm**: Type "CLONE" to start the cloning process
+7. **Confirm**: Type `CLONE` exactly to enable and start the cloning process
 8. **Wait**: The cloning will proceed with progress updates
 9. **Complete**: Follow the next steps to test the cloned disk
 
@@ -92,11 +93,11 @@ dotnet build --configuration Release
 2. **Smaller Targets**: Cloning to smaller disks is experimental and may fail.
 3. **Hot Plug Issues**: If USB disconnects during clone, operation will fail and target will be marked incomplete.
 4. **UEFI vs BIOS**: Tested primarily with UEFI/GPT. MBR/BIOS support is basic.
-5. **Boot Configuration**: BCD updates are skipped in MVP; manual intervention may be required.
+5. **Boot Configuration**: Boot files are rebuilt on target EFI; if hardware-specific issues remain, manual repair may still be required.
 
 ## Logs
 
-Logs are saved to: `%USERPROFILE%\Documents\DiskCloner\Logs\clone_YYYYMMDD_HHmmss.log`
+Logs are saved next to the launched executable: `clone_YYYYMMDD_HHmmss.log`
 
 ## Troubleshooting
 

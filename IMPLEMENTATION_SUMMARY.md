@@ -178,16 +178,11 @@ create partition primary size=... offset=...
 
 ### 3.4 Bootability
 
-**EFI Partition Copy:**
-- Byte-for-byte copy preserves:
-  - Boot manager (bootmgfw.efi)
-  - BCD store
-  - All EFI binaries
-
-**No BCD Modification:**
-- BCD uses volume numbers that Windows assigns dynamically
-- Boot manager resolves at runtime
-- If issues: Run `bcdboot C:\Windows /s S: /f UEFI`
+**EFI + BCD Finalization:**
+- EFI partition contents are copied from source
+- Target Windows and EFI partitions are mounted temporarily
+- `bcdboot` rebuilds boot files on target EFI (`/f UEFI /c`)
+- Post-copy filesystem fix-up (`chkdsk /f`) is applied before unmount
 
 ### 3.5 Partition Expansion
 
@@ -253,7 +248,7 @@ create partition primary size=... offset=...
 4. **Dynamic Disks:** Not supported
 5. **RAID Arrays:** Clones individual disk, not logical volume
 6. **Hot Plug:** USB disconnect causes failure
-7. **BCD Updates:** Skipped in MVP, may need manual fix
+7. **BCD/Boot Repair:** Automated for UEFI flow; BIOS/MBR may still require manual repair
 8. **Multiple Volumes:** Only partitions on system disk
 9. **Recovery Partition:** Basic copy, OEM-specific features not tested
 10. **Secure Boot:** Entries copied but not validated on all hardware
@@ -293,7 +288,7 @@ dotnet build --configuration Release
    - VSS: Enable (recommended)
    - Verification: Sampling (default) or Full
    - Expand: Enable for larger targets
-   - Smaller target: Enable only if data fits
+   - Smaller target: Disabled by default; enable only if data fits
 5. **Generate Preview:**
    - Review operation summary
    - Check estimated time

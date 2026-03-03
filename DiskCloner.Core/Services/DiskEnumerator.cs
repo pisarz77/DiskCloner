@@ -654,7 +654,10 @@ public class DiskEnumerator
         // 3. Fallback check for drive letter (typically C:)
         if (!partition.IsSystemPartition && partition.DriveLetter.HasValue)
         {
-            if (partition.DriveLetter == 'C' || partition.DriveLetter.ToString().Equals(_systemDriveLetter, StringComparison.OrdinalIgnoreCase))
+            var driveLetter = char.ToUpperInvariant(partition.DriveLetter.Value);
+            if (driveLetter == 'C' ||
+                (!string.IsNullOrWhiteSpace(_systemDriveLetter) &&
+                 string.Equals(driveLetter.ToString(), _systemDriveLetter, StringComparison.OrdinalIgnoreCase)))
             {
                 partition.IsSystemPartition = true;
             }
