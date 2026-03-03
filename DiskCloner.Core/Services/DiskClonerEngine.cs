@@ -2,9 +2,11 @@ using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
 using System.Globalization;
+using System.Management;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace DiskCloner.Core.Services;
@@ -15,6 +17,8 @@ namespace DiskCloner.Core.Services;
 /// </summary>
 public class DiskClonerEngine
 {
+    private const long OneMiB = 1024L * 1024L;
+
     // More tolerant regex to handle locale decimal separators, optional asterisk, extra trailing columns
     private static readonly Regex DiskPartPartitionLineRegex = new(
         @"^\s*\*?\s*Partition\s+(?<number>\d+)\s+(?<type>.+?)\s+(?<sizeValue>\d+[\d.,]*)\s+(?<sizeUnit>KB|MB|GB|TB|B|Bytes)?\s+(?<offsetValue>\d+[\d.,]*)\s+(?<offsetUnit>KB|MB|GB|TB|B|Bytes)?(\s+.*)?$",
@@ -63,7 +67,7 @@ public class DiskClonerEngine
             Success = false,
             IsBootable = false
         };
-        var targetDiskWasPrepared = false; // Track if we took the disk offline
+        var targetDiskWasPrepared = false; // Track whether target preparation ran
 
         try
         {
@@ -92,7 +96,7 @@ public class DiskClonerEngine
             ReportProgress(progress);
 
             await PrepareTargetDiskAsync(operation, progress);
-            targetDiskWasPrepared = true; // Disk is now offline, must be brought back online
+            targetDiskWasPrepared = true;
 
             // Step 4: Copy partition data
             progress.Stage = CloneStage.CopyingData;
@@ -104,7 +108,7 @@ public class DiskClonerEngine
             progress.TotalBytes = totalBytesToCopy;
             var bytesCopied = 0L;
             var migratedPartitionNumbers = new HashSet<int>();
-            var targetDiskIsOffline = true;
+            var targetDiskIsOffline = false;
             var partitionCopyFailures = new List<string>();
             Exception? firstPartitionCopyException = null;
 
@@ -228,7 +232,8 @@ public class DiskClonerEngine
                 progress.StatusMessage = "Verifying data integrity...";
                 ReportProgress(progress);
 
-                result.IntegrityVerified = await VerifyIntegrityAsync(operation, progress, migratedPartitionNumbers);
+                var excludedFromVerification = BuildVerificationExclusions(operation, migratedPartitionNumbers, result);
+                result.IntegrityVerified = await VerifyIntegrityAsync(operation, progress, excludedFromVerification);
                 if (!result.IntegrityVerified && operation.StrictVerificationFailureStopsClone)
                 {
                     throw new InvalidOperationException("Integrity verification failed; clone aborted due to strict verification setting.");
@@ -242,11 +247,23 @@ public class DiskClonerEngine
             // Step 6: Expand partitions
             if (operation.AutoExpandWindowsPartition || operation.AllowSmallerTarget)
             {
+                if (targetDiskIsOffline)
+                {
+                    await OnlineTargetDiskAsync(operation);
+                    targetDiskIsOffline = false;
+                }
+
                 progress.Stage = CloneStage.ExpandingPartitions;
                 progress.StatusMessage = operation.AllowSmallerTarget ? "Fixing NTFS metadata..." : "Expanding Windows partition...";
                 ReportProgress(progress);
 
                 await ExpandPartitionAsync(operation, progress);
+            }
+
+            if (targetDiskIsOffline)
+            {
+                await OnlineTargetDiskAsync(operation);
+                targetDiskIsOffline = false;
             }
 
             // Step 7: Finalize and mark as bootable
@@ -437,64 +454,92 @@ public class DiskClonerEngine
     public void CalculateTargetLayout(CloneOperation operation)
     {
         // Calculate total required space (including 1MB alignment gaps and overhead)
-        long totalSpaceRequired = 1024 * 1024; // Start with 1MB for MBR/GPT overhead
+        long totalSpaceRequired = OneMiB; // Start with 1MB for MBR/GPT overhead
         foreach (var p in operation.PartitionsToClone)
         {
             totalSpaceRequired += p.SizeBytes;
-            totalSpaceRequired += 1024 * 1024; // Add 1MB alignment buffer per partition
+            totalSpaceRequired += OneMiB; // Add 1MB alignment buffer per partition
         }
 
-        if (operation.TargetDisk.SizeBytes < totalSpaceRequired)
+        var targetIsSmallerThanRequired = operation.TargetDisk.SizeBytes < totalSpaceRequired;
+        if (targetIsSmallerThanRequired && !operation.AllowSmallerTarget)
         {
-            if (operation.AllowSmallerTarget)
+            throw new InvalidOperationException(
+                $"Target disk is too small. Required: {FormatBytes(totalSpaceRequired)}. " +
+                "Enable 'Allow smaller target' to auto-shrink.");
+        }
+
+        // Baseline: clone exact source sizes.
+        foreach (var partition in operation.PartitionsToClone)
+        {
+            partition.TargetSizeBytes = partition.SizeBytes;
+        }
+
+        var systemPartition = operation.PartitionsToClone
+            .OrderBy(p => p.StartingOffset)
+            .FirstOrDefault(p => p.IsSystemPartition);
+        if (systemPartition == null)
+            return;
+
+        if (targetIsSmallerThanRequired)
+        {
+            // Smaller-target mode: keep non-system partitions near source size and shrink Windows.
+            foreach (var partition in operation.PartitionsToClone)
             {
-                // Magic Auto-Shrink Path
-                long reservedSpace = 64L * 1024 * 1024; // GPT headers/safety
-                foreach (var p in operation.PartitionsToClone)
+                if (!partition.IsSystemPartition)
                 {
-                    if (!p.IsSystemPartition)
-                    {
-                        reservedSpace += p.SizeBytes;
-                        reservedSpace += 2 * 1024 * 1024; // 2MB Alignment buffer per partition
-                    }
-                }
-
-                long availableForSystem = operation.TargetDisk.SizeBytes - reservedSpace - (256L * 1024 * 1024); // 256MB safety margin
-                if (availableForSystem < (5L * 1024 * 1024 * 1024)) // Min 5GB
-                {
-                    throw new InvalidOperationException($"Target disk is too small even with shrinking. Only {FormatBytes(availableForSystem)} available for Windows.");
-                }
-
-                // Align to 1MB boundary
-                availableForSystem = (availableForSystem / (1024 * 1024)) * (1024 * 1024);
-
-                foreach (var p in operation.PartitionsToClone)
-                {
-                    if (p.IsSystemPartition)
-                    {
-                        p.TargetSizeBytes = availableForSystem;
-                    }
-                    else 
-                    {
-                        p.TargetSizeBytes = (p.SizeBytes / (1024 * 1024)) * (1024 * 1024);
-                    }
+                    partition.TargetSizeBytes = Math.Max(OneMiB, (partition.SizeBytes / OneMiB) * OneMiB);
                 }
             }
-            else
+
+            var maxSystemBytes = CalculateMaximumSystemPartitionBytes(operation, systemPartition);
+            if (maxSystemBytes < (5L * 1024 * 1024 * 1024)) // Min 5GB
             {
                 throw new InvalidOperationException(
-                    $"Target disk is too small. Required: {FormatBytes(totalSpaceRequired)}. " +
-                    "Enable 'Allow smaller target' to auto-shrink.");
+                    $"Target disk is too small even with shrinking. Only {FormatBytes(maxSystemBytes)} available for Windows.");
             }
+
+            systemPartition.TargetSizeBytes = maxSystemBytes;
+            _logger.Info($"Layout planning: shrinking Windows partition to {FormatBytes(maxSystemBytes)} to fit target.");
+            return;
         }
-        else
+
+        // Larger/equal target mode: pre-size Windows partition before creating trailing partitions.
+        if (operation.AutoExpandWindowsPartition)
         {
-            // Normal case: All partitions fit as is
-            foreach (var p in operation.PartitionsToClone)
+            var maxSystemBytes = CalculateMaximumSystemPartitionBytes(operation, systemPartition);
+            if (maxSystemBytes > systemPartition.SizeBytes)
             {
-                p.TargetSizeBytes = p.SizeBytes;
+                systemPartition.TargetSizeBytes = maxSystemBytes;
+                _logger.Info(
+                    $"Layout planning: pre-expanding Windows partition to {FormatBytes(maxSystemBytes)} " +
+                    "while reserving space for remaining partitions.");
             }
         }
+    }
+
+    private long CalculateMaximumSystemPartitionBytes(CloneOperation operation, PartitionInfo systemPartition)
+    {
+        var totalDiskMb = operation.TargetDisk.SizeBytes / OneMiB;
+        if (totalDiskMb <= 0)
+            return 0;
+
+        long nonSystemMb = 0;
+        foreach (var partition in operation.PartitionsToClone.Where(p => !ReferenceEquals(p, systemPartition)))
+        {
+            nonSystemMb += GetDiskPartSizeMegabytes(partition.TargetSizeBytes);
+        }
+
+        // Reserve GPT/MBR overhead and extra alignment slack so diskpart can still place trailing partitions.
+        var baseOverheadMb = operation.SourceDisk.IsGpt ? 8L : 1L;
+        var implicitMsrMb = operation.SourceDisk.IsGpt && !operation.PartitionsToClone.Any(p => p.IsMsrPartition) ? 16L : 0L;
+        var alignmentSlackMb = operation.PartitionsToClone.Count + 2L;
+
+        var systemMb = totalDiskMb - nonSystemMb - baseOverheadMb - implicitMsrMb - alignmentSlackMb;
+        if (systemMb <= 0)
+            return 0;
+
+        return systemMb * OneMiB;
     }
 
     private string FormatBytes(long bytes)
@@ -586,9 +631,9 @@ public class DiskClonerEngine
             .ToList();
 
         scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
-        scriptContent.AppendLine("clean");
         scriptContent.AppendLine("online disk noerr");
         scriptContent.AppendLine("attributes disk clear readonly noerr");
+        scriptContent.AppendLine("clean");
 
         if (operation.SourceDisk.IsGpt)
         {
@@ -602,7 +647,7 @@ public class DiskClonerEngine
         // Create partitions matching the source
         foreach (var partition in orderedSourcePartitions)
         {
-            var sizeMB = partition.TargetSizeBytes / (1024 * 1024);
+            var sizeMB = GetDiskPartSizeMegabytes(partition.TargetSizeBytes);
             
             if (partition.IsEfiPartition)
             {
@@ -626,12 +671,6 @@ public class DiskClonerEngine
 
         // List partitions to verify
         scriptContent.AppendLine("list partition");
-
-        // Take disk offline so Windows releases all volume mounts
-        // This is CRITICAL: without this, WriteFile to the PhysicalDrive will fail
-        // because Windows blocks writes to disks with mounted volumes.
-        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
-        scriptContent.AppendLine("offline disk");
 
         AssertDiskpartScriptTargetsOnlyTargetDisk(operation, scriptContent.ToString(), "create partition table");
         await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
@@ -665,7 +704,8 @@ public class DiskClonerEngine
                 }
                 else
                 {
-                    ApplyTargetPartitionOffsets(operation, output);
+                    var targetPartitions = await QueryTargetPartitionLayoutAsync(operation);
+                    ApplyTargetPartitionOffsets(operation, targetPartitions);
                     _logger.Info("Partitions created successfully");
                 }
             }
@@ -680,24 +720,152 @@ public class DiskClonerEngine
         }
     }
 
-    private void ApplyTargetPartitionOffsets(CloneOperation operation, string diskPartOutput)
+    internal static long GetDiskPartSizeMegabytes(long sizeBytes)
+    {
+        if (sizeBytes <= 0)
+        {
+            throw new InvalidOperationException($"Invalid partition size for diskpart: {sizeBytes} bytes.");
+        }
+
+        return Math.Max(1L, (sizeBytes + OneMiB - 1) / OneMiB);
+    }
+
+    private async Task<List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>> QueryTargetPartitionLayoutAsync(CloneOperation operation)
+    {
+        return await Task.Run(() =>
+        {
+            var partitions = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT Index, Type, Size, StartingOffset FROM Win32_DiskPartition WHERE DiskIndex = {operation.TargetDisk.DiskNumber}");
+            using var results = searcher.Get();
+
+            foreach (ManagementObject partitionObj in results)
+            {
+                using (partitionObj)
+                {
+                    var indexObj = partitionObj["Index"];
+                    var typeObj = partitionObj["Type"];
+                    var sizeObj = partitionObj["Size"];
+                    var offsetObj = partitionObj["StartingOffset"];
+
+                    int partitionIndex;
+                    long sizeBytes;
+                    long offsetBytes;
+
+                    try
+                    {
+                        partitionIndex = Convert.ToInt32(indexObj, CultureInfo.InvariantCulture);
+                        sizeBytes = Convert.ToInt64(sizeObj, CultureInfo.InvariantCulture);
+                        offsetBytes = Convert.ToInt64(offsetObj, CultureInfo.InvariantCulture);
+                    }
+                    catch
+                    {
+                        continue;
+                    }
+
+                    if (partitionIndex < 0 || sizeBytes <= 0 || offsetBytes < 0)
+                        continue;
+
+                    var typeName = NormalizeDiskPartType(typeObj?.ToString() ?? string.Empty);
+                    partitions.Add((partitionIndex + 1, typeName, sizeBytes, offsetBytes));
+                }
+            }
+
+            return partitions
+                .OrderBy(p => p.StartingOffsetBytes)
+                .ToList();
+        });
+    }
+
+    internal static List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)> ParseTargetPartitionLayoutJson(string json)
+    {
+        var result = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+        if (string.IsNullOrWhiteSpace(json))
+            return result;
+
+        using var doc = JsonDocument.Parse(json.Trim());
+
+        static void TryAdd(
+            JsonElement element,
+            List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)> destination)
+        {
+            if (!TryReadInt32Json(element, "PartitionNumber", out var partitionNumber))
+                return;
+            if (!TryReadInt64Json(element, "Size", out var sizeBytes))
+                return;
+            if (!TryReadInt64Json(element, "Offset", out var offsetBytes))
+                return;
+
+            string typeText = element.TryGetProperty("Type", out var typeProp) ? typeProp.ToString() : string.Empty;
+            destination.Add((partitionNumber, NormalizeDiskPartType(typeText), sizeBytes, offsetBytes));
+        }
+
+        if (doc.RootElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var element in doc.RootElement.EnumerateArray())
+            {
+                TryAdd(element, result);
+            }
+        }
+        else if (doc.RootElement.ValueKind == JsonValueKind.Object)
+        {
+            TryAdd(doc.RootElement, result);
+        }
+
+        return result
+            .OrderBy(p => p.StartingOffsetBytes)
+            .ToList();
+    }
+
+    private static bool TryReadInt32Json(JsonElement element, string propertyName, out int value)
+    {
+        value = 0;
+        if (!element.TryGetProperty(propertyName, out var property))
+            return false;
+
+        if (property.ValueKind == JsonValueKind.Number)
+            return property.TryGetInt32(out value);
+
+        if (property.ValueKind == JsonValueKind.String)
+            return int.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+
+        return false;
+    }
+
+    private static bool TryReadInt64Json(JsonElement element, string propertyName, out long value)
+    {
+        value = 0;
+        if (!element.TryGetProperty(propertyName, out var property))
+            return false;
+
+        if (property.ValueKind == JsonValueKind.Number)
+            return property.TryGetInt64(out value);
+
+        if (property.ValueKind == JsonValueKind.String)
+            return long.TryParse(property.GetString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+
+        return false;
+    }
+
+    private void ApplyTargetPartitionOffsets(
+        CloneOperation operation,
+        List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)> targetPartitions)
     {
         var sourcePartitions = operation.PartitionsToClone
             .OrderBy(p => p.StartingOffset)
             .ToList();
-        var targetPartitions = ParsePartitionTableFromDiskPartOutput(diskPartOutput);
 
         if (targetPartitions.Count < sourcePartitions.Count)
         {
             throw new InvalidOperationException(
                 $"Partition mapping failed: expected at least {sourcePartitions.Count} target partitions, " +
-                $"but diskpart listed {targetPartitions.Count}. Aborting to avoid incorrect writes.");
+                $"but target layout query returned {targetPartitions.Count}. Aborting to avoid incorrect writes.");
         }
 
         if (targetPartitions.Count > sourcePartitions.Count)
         {
             _logger.Warning(
-                $"diskpart listed {targetPartitions.Count} partitions but only {sourcePartitions.Count} are scheduled for cloning. " +
+                $"Target layout query returned {targetPartitions.Count} partitions but only {sourcePartitions.Count} are scheduled for cloning. " +
                 "Matching source partitions by expected type and order.");
         }
 
@@ -843,6 +1011,8 @@ public class DiskClonerEngine
             return "System";
         if (normalized.Contains("recovery"))
             return "Recovery";
+        if (normalized.Contains("basic"))
+            return "Primary";
         if (normalized.Contains("primary"))
             return "Primary";
 
@@ -1187,7 +1357,7 @@ public class DiskClonerEngine
 
             // Read the full volume bitmap via FSCTL_GET_VOLUME_BITMAP
             // The API returns it in chunks; we request from LCN 0 and keep going until done
-            long totalClusters = 0;
+            long totalClusters = -1;
             byte[]? bitmap = null;
             long startingLcn = 0;
 
@@ -1241,17 +1411,42 @@ public class DiskClonerEngine
                 }
 
                 // Parse header: StartingLcn (8 bytes) + BitmapSize in clusters (8 bytes).
-                // IMPORTANT: BitmapSize is the total volume cluster count, not this chunk size.
+                // BitmapSize may be reported relative to chunk start on some stacks, so we
+                // normalize to absolute cluster end for robust assembly.
                 long chunkStartLcn = BitConverter.ToInt64(outputBuffer, 0);
-                totalClusters = BitConverter.ToInt64(outputBuffer, 8);
-                if (totalClusters <= 0)
+                long chunkBitmapSize = BitConverter.ToInt64(outputBuffer, 8);
+                if (chunkBitmapSize <= 0)
                 {
                     return await FallbackToRawCopyOrThrowAsync(
                         operation,
                         partition,
                         progress,
                         totalBytesAlreadyCopied,
-                        $"FSCTL_GET_VOLUME_BITMAP returned invalid cluster count ({totalClusters})");
+                        $"FSCTL_GET_VOLUME_BITMAP returned invalid bitmap size ({chunkBitmapSize})");
+                }
+
+                long chunkEndCluster;
+                try
+                {
+                    chunkEndCluster = checked(chunkStartLcn + chunkBitmapSize);
+                }
+                catch (OverflowException)
+                {
+                    return await FallbackToRawCopyOrThrowAsync(
+                        operation,
+                        partition,
+                        progress,
+                        totalBytesAlreadyCopied,
+                        $"FSCTL_GET_VOLUME_BITMAP produced overflowing cluster range (start={chunkStartLcn}, size={chunkBitmapSize})");
+                }
+
+                if (totalClusters < 0)
+                {
+                    totalClusters = chunkEndCluster;
+                }
+                else if (chunkEndCluster > totalClusters)
+                {
+                    totalClusters = chunkEndCluster;
                 }
 
                 if (bitmap == null)
@@ -1273,20 +1468,42 @@ public class DiskClonerEngine
                 int payloadBytes = (int)bytesReturned - 16;
                 if (payloadBytes > 0)
                 {
-                    long destByteOffsetLong = chunkStartLcn / 8;
-                    if (destByteOffsetLong < 0 || destByteOffsetLong >= bitmap.Length)
+                    long destBitOffset = chunkStartLcn;
+                    if (destBitOffset < 0 || destBitOffset >= totalClusters)
                     {
                         return await FallbackToRawCopyOrThrowAsync(
                             operation,
                             partition,
                             progress,
                             totalBytesAlreadyCopied,
-                            $"Bitmap chunk offset out of range (chunkStartLCN={chunkStartLcn}, destByte={destByteOffsetLong})");
+                            $"Bitmap chunk offset out of range (chunkStartLCN={chunkStartLcn})");
                     }
 
-                    int destByteOffset = (int)destByteOffsetLong;
-                    int toCopy = Math.Min(payloadBytes, bitmap.Length - destByteOffset);
-                    Array.Copy(outputBuffer, 16, bitmap, destByteOffset, toCopy);
+                    if ((destBitOffset & 7) == 0)
+                    {
+                        int destByteOffset = (int)(destBitOffset / 8);
+                        int toCopy = Math.Min(payloadBytes, bitmap.Length - destByteOffset);
+                        Array.Copy(outputBuffer, 16, bitmap, destByteOffset, toCopy);
+                    }
+                    else
+                    {
+                        long bitsAvailableFromPayload = (long)payloadBytes * 8;
+                        long bitsUntilBitmapEnd = totalClusters - destBitOffset;
+                        long bitsToCopy = Math.Min(bitsAvailableFromPayload, bitsUntilBitmapEnd);
+
+                        for (long bit = 0; bit < bitsToCopy; bit++)
+                        {
+                            int srcByteIndex = 16 + (int)(bit / 8);
+                            int srcBitIndex = (int)(bit % 8);
+                            if ((outputBuffer[srcByteIndex] & (1 << srcBitIndex)) == 0)
+                                continue;
+
+                            long destinationBit = destBitOffset + bit;
+                            int destByteIndex = (int)(destinationBit / 8);
+                            int destBitIndex = (int)(destinationBit % 8);
+                            bitmap[destByteIndex] = (byte)(bitmap[destByteIndex] | (1 << destBitIndex));
+                        }
+                    }
 
                     long chunkClustersReturned = (long)payloadBytes * 8;
                     startingLcn = chunkStartLcn + chunkClustersReturned;
@@ -1312,6 +1529,16 @@ public class DiskClonerEngine
                     progress,
                     totalBytesAlreadyCopied,
                     "FSCTL_GET_VOLUME_BITMAP returned no bitmap data");
+            }
+
+            if (totalClusters <= 0)
+            {
+                return await FallbackToRawCopyOrThrowAsync(
+                    operation,
+                    partition,
+                    progress,
+                    totalBytesAlreadyCopied,
+                    $"FSCTL_GET_VOLUME_BITMAP returned invalid total cluster count ({totalClusters})");
             }
 
             // Find the last allocated cluster to determine minimum required space
@@ -2167,7 +2394,7 @@ public class DiskClonerEngine
         var startInfo = new System.Diagnostics.ProcessStartInfo
         {
             FileName = "bcdboot.exe",
-            Arguments = $"\"{windowsPath}\" /s {NormalizeDriveLetter(efiLetter)}: /f UEFI",
+            Arguments = $"\"{windowsPath}\" /s {NormalizeDriveLetter(efiLetter)}: /f UEFI /c",
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,
@@ -2257,14 +2484,39 @@ public class DiskClonerEngine
     {
         _logger.Info("Verifying data integrity...");
 
-        if (operation.FullHashVerification)
+        if (!operation.FullHashVerification)
         {
-            return await FullHashVerificationAsync(operation, progress, excludedPartitionNumbers);
+            _logger.Warning("Sampling verification is disabled for reliability. Running full hash verification instead.");
         }
-        else
+
+        return await FullHashVerificationAsync(operation, progress, excludedPartitionNumbers);
+    }
+
+    private IReadOnlyCollection<int> BuildVerificationExclusions(
+        CloneOperation operation,
+        IReadOnlyCollection<int> migratedPartitionNumbers,
+        CloneResult result)
+    {
+        var excluded = new HashSet<int>(migratedPartitionNumbers);
+
+        // EFI is usually not part of the VSS snapshot set in this flow (no drive letter),
+        // so live-source reads taken long after copy can drift and trigger false mismatches.
+        // Skip only EFI in this case; keep recovery/data partitions verified.
+        if (operation.UseVss)
         {
-            return await SampleHashVerificationAsync(operation, progress, excludedPartitionNumbers);
+            foreach (var partition in operation.PartitionsToClone.Where(p => p.IsEfiPartition && !p.DriveLetter.HasValue))
+            {
+                if (excluded.Add(partition.PartitionNumber))
+                {
+                    var warning =
+                        $"Skipping verification for EFI partition {partition.PartitionNumber} because it is not snapshot-backed in this workflow.";
+                    _logger.Warning(warning);
+                    result.Warnings.Add(warning);
+                }
+            }
         }
+
+        return excluded;
     }
 
     /// <summary>
@@ -2468,24 +2720,37 @@ public class DiskClonerEngine
         EnsureTargetDiskMutationAllowed(operation, operation.TargetDisk.DiskNumber, "expand partition");
         _logger.Info("Expanding Windows partition on target disk...");
 
-        var scriptPath = Path.GetTempFileName();
-        var scriptContent = new StringBuilder();
-
-        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
+        if (operation.AllowSmallerTarget)
+        {
+            _logger.Info("Skipping diskpart extend in smaller-target mode.");
+            return;
+        }
 
         // Find the Windows partition (usually the last partition in our clone list)
         var systemPartition = operation.PartitionsToClone.FirstOrDefault(p => p.IsSystemPartition);
-        if (systemPartition != null)
+        if (systemPartition == null)
         {
-            if (systemPartition.TargetPartitionNumber <= 0)
-            {
-                throw new InvalidOperationException(
-                    $"Target partition number is not initialized for source system partition {systemPartition.PartitionNumber}. Aborting expansion.");
-            }
-
-            scriptContent.AppendLine($"select partition {systemPartition.TargetPartitionNumber}");
-            scriptContent.AppendLine("extend");
+            _logger.Info("No system partition selected for expansion.");
+            return;
         }
+
+        if (systemPartition.TargetPartitionNumber <= 0)
+        {
+            throw new InvalidOperationException(
+                $"Target partition number is not initialized for source system partition {systemPartition.PartitionNumber}. Aborting expansion.");
+        }
+
+        if (systemPartition.TargetSizeBytes > systemPartition.SizeBytes)
+        {
+            _logger.Info("Skipping diskpart extend: Windows partition was already pre-sized during layout planning.");
+            return;
+        }
+
+        var scriptPath = Path.GetTempFileName();
+        var scriptContent = new StringBuilder();
+        scriptContent.AppendLine($"select disk {operation.TargetDisk.DiskNumber}");
+        scriptContent.AppendLine($"select partition {systemPartition.TargetPartitionNumber}");
+        scriptContent.AppendLine("extend");
 
         AssertDiskpartScriptTargetsOnlyTargetDisk(operation, scriptContent.ToString(), "expand partition");
         await File.WriteAllTextAsync(scriptPath, scriptContent.ToString());
@@ -2618,6 +2883,13 @@ public class DiskClonerEngine
             var (exitCode, output, error) = await RunProcessAsync(startInfo);
             if (exitCode != 0)
             {
+                var combined = $"{output}\n{error}";
+                if (combined.Contains("already offline", StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.Info("Target disk is already offline");
+                    return;
+                }
+
                 throw new IOException($"diskpart offline failed with code {exitCode}. Output: {output}. Error: {error}");
             }
 
@@ -2660,21 +2932,22 @@ public class DiskClonerEngine
                 RedirectStandardError = true
             };
 
-            using var process = System.Diagnostics.Process.Start(startInfo);
-            if (process != null)
+            var (exitCode, output, error) = await RunProcessAsync(startInfo);
+            if (exitCode != 0)
             {
-                var output = await process.StandardOutput.ReadToEndAsync();
-                var error = await process.StandardError.ReadToEndAsync();
-                await process.WaitForExitAsync();
-
-                if (process.ExitCode != 0)
+                var combined = $"{output}\n{error}";
+                if (combined.Contains("already online", StringComparison.OrdinalIgnoreCase))
                 {
-                    _logger.Warning($"diskpart online failed with code {process.ExitCode}. Output: {output}");
+                    _logger.Info("Target disk is already online");
                 }
                 else
                 {
-                    _logger.Info("Target disk brought back online successfully");
+                    _logger.Warning($"diskpart online failed with code {exitCode}. Output: {output}");
                 }
+            }
+            else
+            {
+                _logger.Info("Target disk brought back online successfully");
             }
         }
         finally
@@ -2692,16 +2965,170 @@ public class DiskClonerEngine
     private async Task UpdateBootConfigurationAsync(CloneOperation operation)
     {
         _logger.Info("Updating boot configuration...");
+        EnsureTargetDiskMutationAllowed(operation, operation.TargetDisk.DiskNumber, "update boot configuration");
 
-        // Find the Windows partition on target
-        // In a real implementation, you would need to discover which partition on
-        // the target corresponds to C: and mount it temporarily
+        var systemPartition = operation.PartitionsToClone.FirstOrDefault(p => p.IsSystemPartition);
+        if (systemPartition == null)
+            throw new InvalidOperationException("Cannot update boot configuration: no system partition is selected.");
+        if (systemPartition.TargetPartitionNumber <= 0)
+            throw new InvalidOperationException(
+                $"Cannot update boot configuration: target partition number is missing for source system partition {systemPartition.PartitionNumber}.");
 
-        // For this implementation, we'll use bcdboot to recreate the boot files
-        // This requires mounting the target disk partitions, which is complex
-        // We'll skip this step in the MVP but document it
+        var isUefi = operation.SourceDisk.IsGpt;
+        var efiPartition = operation.PartitionsToClone.FirstOrDefault(p => p.IsEfiPartition);
+        if (isUefi && (efiPartition == null || efiPartition.TargetPartitionNumber <= 0))
+        {
+            throw new InvalidOperationException("Cannot update UEFI boot configuration: target EFI partition is missing.");
+        }
 
-        _logger.Info("Boot configuration update skipped in MVP (manual step may be required)");
+        var windowsLetter = GetAvailableDriveLetter('W', 'V', 'T', 'R', 'Q');
+        EnsureTargetVolumeMutationAllowed(operation, windowsLetter, "mount target windows partition");
+
+        char? efiLetter = null;
+        try
+        {
+            await MountExistingTargetPartitionAsync(operation, systemPartition.TargetPartitionNumber, windowsLetter);
+            ValidateMountedWindowsPartitionAsync(systemPartition, windowsLetter);
+            await ExpandMountedNtfsFileSystemAsync(operation, windowsLetter);
+            await RepairMountedWindowsVolumeAsync(operation, windowsLetter);
+
+            if (isUefi)
+            {
+                efiLetter = GetAvailableDriveLetter('S', 'P', 'O', 'N');
+                EnsureTargetVolumeMutationAllowed(operation, efiLetter.Value, "mount target efi partition");
+                await MountExistingTargetPartitionAsync(operation, efiPartition!.TargetPartitionNumber, efiLetter.Value);
+                await RebuildBootFilesAsync(operation, windowsLetter, efiLetter.Value);
+                ValidateEfiBootArtifacts(efiLetter.Value);
+            }
+            else
+            {
+                _logger.Warning("Legacy BIOS boot repair is not automated yet. Manual boot repair may be required for MBR clones.");
+            }
+        }
+        finally
+        {
+            if (efiLetter.HasValue)
+            {
+                await UnmountTargetPartitionAsync(operation, efiLetter.Value);
+            }
+
+            await UnmountTargetPartitionAsync(operation, windowsLetter);
+        }
+    }
+
+    private void ValidateMountedWindowsPartitionAsync(PartitionInfo systemPartition, char windowsLetter)
+    {
+        var windowsRoot = $@"{NormalizeDriveLetter(windowsLetter)}:\Windows";
+        if (!Directory.Exists(windowsRoot))
+        {
+            throw new IOException(
+                $"Mounted target system partition {systemPartition.TargetPartitionNumber} does not contain Windows directory at '{windowsRoot}'.");
+        }
+
+        var systemHivePath = Path.Combine(windowsRoot, "System32", "config", "SYSTEM");
+        if (!File.Exists(systemHivePath))
+        {
+            throw new IOException(
+                $"Mounted target system partition {systemPartition.TargetPartitionNumber} is missing '{systemHivePath}'.");
+        }
+    }
+
+    private async Task ExpandMountedNtfsFileSystemAsync(CloneOperation operation, char windowsLetter)
+    {
+        EnsureTargetVolumeMutationAllowed(operation, windowsLetter, "expand mounted target filesystem");
+        var scriptPath = Path.GetTempFileName();
+        var script = new StringBuilder()
+            .AppendLine($"select volume {NormalizeDriveLetter(windowsLetter)}")
+            .AppendLine("extend filesystem")
+            .ToString();
+
+        await File.WriteAllTextAsync(scriptPath, script);
+        try
+        {
+            var startInfo = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "diskpart.exe",
+                Arguments = $"/s \"{scriptPath}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true
+            };
+
+            var (exitCode, output, error) = await RunProcessAsync(startInfo);
+            _logger.Info($"DiskPart filesystem extend output: {output}");
+            if (exitCode != 0)
+            {
+                _logger.Warning($"Failed to extend NTFS filesystem on {NormalizeDriveLetter(windowsLetter)}:. ExitCode={exitCode}. Error={error}");
+            }
+        }
+        finally
+        {
+            try { File.Delete(scriptPath); } catch { }
+        }
+    }
+
+    private async Task RepairMountedWindowsVolumeAsync(CloneOperation operation, char windowsLetter)
+    {
+        EnsureTargetVolumeMutationAllowed(operation, windowsLetter, "repair mounted target filesystem");
+        var normalized = NormalizeDriveLetter(windowsLetter);
+        var volumeArg = $"{normalized}:";
+
+        var chkdskStartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "chkdsk.exe",
+            Arguments = $"{volumeArg} /f /x",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (chkdskExitCode, chkdskOutput, chkdskError) = await RunProcessAsync(chkdskStartInfo);
+        _logger.Info($"CHKDSK /f output for {volumeArg}: {chkdskOutput}");
+        if (chkdskExitCode > 3)
+        {
+            throw new IOException($"chkdsk /f failed for {volumeArg}: (code {chkdskExitCode}) {chkdskError}");
+        }
+
+        var fsutilStartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "fsutil.exe",
+            Arguments = $"dirty query {volumeArg}",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (fsutilExitCode, fsutilOutput, fsutilError) = await RunProcessAsync(fsutilStartInfo);
+        _logger.Info($"fsutil dirty query output for {volumeArg}: {fsutilOutput}");
+        if (fsutilExitCode != 0)
+        {
+            throw new IOException($"fsutil dirty query failed for {volumeArg}: (code {fsutilExitCode}) {fsutilError}");
+        }
+
+        if (fsutilOutput.Contains("is dirty", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new IOException($"Target Windows volume {volumeArg} remains dirty after chkdsk /f.");
+        }
+    }
+
+    private void ValidateEfiBootArtifacts(char efiLetter)
+    {
+        var normalized = NormalizeDriveLetter(efiLetter);
+        var bcdPath = $@"{normalized}:\EFI\Microsoft\Boot\BCD";
+        var bootx64Path = $@"{normalized}:\EFI\Boot\bootx64.efi";
+
+        if (!File.Exists(bcdPath))
+        {
+            throw new IOException($"EFI boot artifact missing after bcdboot: '{bcdPath}'.");
+        }
+
+        if (!File.Exists(bootx64Path))
+        {
+            _logger.Warning($"EFI fallback loader not found at '{bootx64Path}'. Firmware may still boot via Microsoft\\Boot\\BCD entry.");
+        }
     }
 
     /// <summary>
@@ -2799,8 +3226,10 @@ public class DiskClonerEngine
     /// </summary>
     public string GetOperationSummary(CloneOperation operation)
     {
-        // Ensure layout is calculated before generating summary
-        try { CalculateTargetLayout(operation); } catch { }
+        // Ensure layout is calculated before generating summary.
+        // If layout is invalid, preview must surface the error instead of silently
+        // showing stale/default sizes.
+        CalculateTargetLayout(operation);
 
         var sb = new StringBuilder();
         sb.AppendLine("=== Cloning Operation Summary ===");
@@ -2817,24 +3246,24 @@ public class DiskClonerEngine
         sb.AppendLine($"  Size: {operation.TargetDisk.SizeDisplay}");
         sb.AppendLine($"  Type: {(operation.TargetDisk.IsGpt ? "GPT/UEFI" : "MBR/BIOS")}");
         sb.AppendLine();
-        sb.AppendLine("Partitions to Clone:");
+        sb.AppendLine("Partition Plan (source -> target):");
         foreach (var partition in operation.PartitionsToClone)
         {
             var role = partition.GetTypeName();
             var label = string.IsNullOrEmpty(partition.VolumeLabel) ? "" : $" [{partition.VolumeLabel}]";
-            sb.AppendLine($"  [{partition.PartitionNumber}] {role}{label} - {partition.SizeDisplay}");
+            var sourceSize = FormatBytes(partition.SizeBytes);
+            var targetSize = FormatBytes(partition.TargetSizeBytes);
+            var resizeInfo = partition.TargetSizeBytes < partition.SizeBytes
+                ? " [SHRUNK]"
+                : partition.TargetSizeBytes > partition.SizeBytes
+                    ? " [EXPANDED]"
+                    : "";
+            sb.AppendLine($"  [{partition.PartitionNumber}] {role}{label}: {sourceSize} -> {targetSize}{resizeInfo}");
         }
         sb.AppendLine();
-        sb.AppendLine("Planned Target Layout:");
-        foreach (var partition in operation.PartitionsToClone)
-        {
-            var role = partition.GetTypeName();
-            var targetSize = FormatBytes(partition.TargetSizeBytes);
-            var shrinkInfo = (partition.TargetSizeBytes < partition.SizeBytes) 
-                ? $" [SHRUNK from {partition.SizeDisplay}]" 
-                : "";
-            sb.AppendLine($"  [{partition.PartitionNumber}] {role} - {targetSize}{shrinkInfo}");
-        }
+        var plannedFootprint = OneMiB;
+        plannedFootprint += operation.PartitionsToClone.Sum(p => p.TargetSizeBytes + OneMiB);
+        sb.AppendLine($"Planned Target Footprint: {FormatBytes(plannedFootprint)} / {operation.TargetDisk.SizeDisplay}");
         sb.AppendLine();
 
         sb.AppendLine("Options:");

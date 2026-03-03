@@ -12,6 +12,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove=".tmp\**\*.cs" />
     <ProjectReference Include="..\DiskCloner.Core\DiskCloner.Core.csproj" />
   </ItemGroup>
 

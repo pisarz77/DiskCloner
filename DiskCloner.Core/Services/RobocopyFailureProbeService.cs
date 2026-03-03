@@ -131,7 +131,8 @@ public sealed class RobocopyFailureProbeService
             .Select(d => char.ToUpperInvariant(d.Name[0]))
             .ToHashSet();
 
-        var discoveredPaths = RobocopyFailureDiagnostics.ExtractProblematicFilePaths(File.ReadLines(logFilePath), maxFiles);
+        var logLines = ReadLogLinesWithSharedAccess(logFilePath);
+        var discoveredPaths = RobocopyFailureDiagnostics.ExtractProblematicFilePaths(logLines, maxFiles);
         var result = new RobocopyProbeResult
         {
             LogFilePath = logFilePath,
@@ -215,6 +216,28 @@ public sealed class RobocopyFailureProbeService
             $"Failed={result.FailureCount}, Summary={summaryPath}");
 
         return result;
+    }
+
+    private static IReadOnlyList<string> ReadLogLinesWithSharedAccess(string logFilePath)
+    {
+        using var stream = new FileStream(
+            logFilePath,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.ReadWrite | FileShare.Delete);
+
+        using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        var lines = new List<string>();
+        while (true)
+        {
+            var line = reader.ReadLine();
+            if (line == null)
+                break;
+
+            lines.Add(line);
+        }
+
+        return lines;
     }
 
     private static string BuildProbeTargetDirectory(string destinationRoot, string sourcePath, char fallbackSourceDriveLetter)

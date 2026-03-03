@@ -14,20 +14,19 @@ public class CloneEngineSafetyTests
         var engine = CreateEngine();
         var operation = CreateOperationForMapping();
 
-        var diskpartOutput = @"
-  Partition ###  Type              Size     Offset
-  -------------  ----------------  -------  -------
-  Partition 1    Reserved            15 MB    17 KB
-  Partition 2    System             100 MB    16 MB
-  Partition 3    Primary            236 GB   116 MB
-  Partition 4    Recovery           533 MB   236 GB
-* Partition 5    Recovery           768 MB   237 GB
-";
+        var targetPartitions = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>
+        {
+            (1, "Reserved", 15L * 1024 * 1024, 17L * 1024),
+            (2, "System", 100L * 1024 * 1024, 16L * 1024 * 1024),
+            (3, "Primary", 236L * 1024 * 1024 * 1024, 116L * 1024 * 1024),
+            (4, "Recovery", 533L * 1024 * 1024, 236L * 1024 * 1024 * 1024),
+            (5, "Recovery", 768L * 1024 * 1024, 237L * 1024 * 1024 * 1024)
+        };
 
         InvokePrivate(
             engine,
             "ApplyTargetPartitionOffsets",
-            new object[] { operation, diskpartOutput });
+            new object[] { operation, targetPartitions });
 
         var efi = operation.PartitionsToClone.Single(p => p.IsEfiPartition);
         var sys = operation.PartitionsToClone.Single(p => p.IsSystemPartition);
@@ -66,6 +65,44 @@ public class CloneEngineSafetyTests
 
         var strategy = InvokePrivate(engine, "GetCopyStrategy", new object[] { operation, system });
         Assert.Equal("FileSystemMigration", strategy?.ToString());
+    }
+
+    [Fact]
+    public void GetOperationSummary_ShowsSourceToTargetSizes_WithExpandedSystemPartition()
+    {
+        var engine = CreateEngine();
+        var operation = new CloneOperation
+        {
+            SourceDisk = new DiskInfo
+            {
+                DiskNumber = 0,
+                IsGpt = true,
+                SizeBytes = 476L * 1024 * 1024 * 1024
+            },
+            TargetDisk = new DiskInfo
+            {
+                DiskNumber = 1,
+                IsGpt = true,
+                SizeBytes = 238L * 1024 * 1024 * 1024
+            },
+            AutoExpandWindowsPartition = true,
+            AllowSmallerTarget = false,
+            PartitionsToClone = new List<PartitionInfo>
+            {
+                new() { PartitionNumber = 1, StartingOffset = 1_048_576, SizeBytes = 100L * 1024 * 1024, IsEfiPartition = true, FileSystemType = "FAT32" },
+                new() { PartitionNumber = 2, StartingOffset = 122_683_392, SizeBytes = 103L * 1024 * 1024 * 1024, IsSystemPartition = true, DriveLetter = 'C', FileSystemType = "NTFS" },
+                new() { PartitionNumber = 3, StartingOffset = 510_744_592_384, SizeBytes = 533L * 1024 * 1024, IsRecoveryPartition = true },
+                new() { PartitionNumber = 4, StartingOffset = 511_303_483_392, SizeBytes = 768L * 1024 * 1024, IsRecoveryPartition = true }
+            }
+        };
+
+        var summary = engine.GetOperationSummary(operation);
+        var systemPartition = operation.PartitionsToClone.Single(p => p.IsSystemPartition);
+
+        Assert.True(systemPartition.TargetSizeBytes > systemPartition.SizeBytes);
+        Assert.Contains("Partition Plan (source -> target):", summary);
+        Assert.Contains("[2] Windows/System:", summary);
+        Assert.Contains("[EXPANDED]", summary);
     }
 
     private static object? InvokePrivate(object instance, string methodName, object[] args)

@@ -408,7 +408,7 @@ public partial class MainWindow : Window
         var logPath = ResolveProbeLogPath();
         if (string.IsNullOrWhiteSpace(logPath) || !File.Exists(logPath))
         {
-            MessageBox.Show("No clone log file found for diagnostics.", "Probe",
+            MessageBox.Show("No readable clone log file found for diagnostics.", "Probe",
                 MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
@@ -420,7 +420,7 @@ public partial class MainWindow : Window
             DateTime.UtcNow.ToString("yyyyMMdd_HHmmss"));
 
         var fallbackDrive = GetSystemDriveLetter();
-        ProbeStatusTextBlock.Text = "Running robocopy probe...";
+        ProbeStatusTextBlock.Text = $"Running robocopy probe using log: {logPath}";
         RunRobocopyProbeButton.IsEnabled = false;
 
         try
@@ -461,20 +461,87 @@ public partial class MainWindow : Window
 
     private string? ResolveProbeLogPath()
     {
+        var candidates = EnumerateProbeLogCandidates()
+            .Distinct(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var candidate in candidates)
+        {
+            if (IsLogReadable(candidate))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private IEnumerable<string> EnumerateProbeLogCandidates()
+    {
         if (_logger is FileLogger fileLogger && File.Exists(fileLogger.LogFilePath))
-            return fileLogger.LogFilePath;
+            yield return fileLogger.LogFilePath;
 
         var processPath = Environment.ProcessPath;
         var baseDirectory = !string.IsNullOrWhiteSpace(processPath)
             ? (Path.GetDirectoryName(processPath) ?? AppContext.BaseDirectory)
             : AppContext.BaseDirectory;
 
-        var latestLog = Directory.EnumerateFiles(baseDirectory, "clone_*.log", SearchOption.TopDirectoryOnly)
-            .Select(path => new FileInfo(path))
-            .OrderByDescending(info => info.LastWriteTimeUtc)
-            .FirstOrDefault();
+        foreach (var logPath in EnumerateLogsInDirectory(baseDirectory))
+            yield return logPath;
 
-        return latestLog?.FullName;
+        var publishRoot = Directory.GetParent(baseDirectory)?.FullName;
+        if (string.IsNullOrWhiteSpace(publishRoot) || !Directory.Exists(publishRoot))
+            yield break;
+
+        IEnumerable<string> publishDirs;
+        try
+        {
+            publishDirs = Directory.EnumerateDirectories(publishRoot, "publish_*", SearchOption.TopDirectoryOnly);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        foreach (var publishDir in publishDirs)
+        {
+            foreach (var logPath in EnumerateLogsInDirectory(publishDir))
+                yield return logPath;
+        }
+    }
+
+    private static IEnumerable<string> EnumerateLogsInDirectory(string directoryPath)
+    {
+        if (string.IsNullOrWhiteSpace(directoryPath) || !Directory.Exists(directoryPath))
+            return Enumerable.Empty<string>();
+
+        try
+        {
+            return Directory.EnumerateFiles(directoryPath, "clone_*.log", SearchOption.TopDirectoryOnly)
+                .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
+                .ToArray();
+        }
+        catch
+        {
+            return Enumerable.Empty<string>();
+        }
+    }
+
+    private static bool IsLogReadable(string logPath)
+    {
+        if (string.IsNullOrWhiteSpace(logPath) || !File.Exists(logPath))
+            return false;
+
+        try
+        {
+            using var stream = new FileStream(
+                logPath,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.ReadWrite | FileShare.Delete);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static char GetSystemDriveLetter()
@@ -658,19 +725,65 @@ public partial class MainWindow : Window
             return false;
         }
 
-        // Size check
-        if (targetDisk.SizeBytes < sourceDisk.SizeBytes && !AllowSmallerTargetCheckBox.IsChecked.GetValueOrDefault())
+        // Size check based on selected partition layout (not whole source disk size).
+        // This allows valid clones where source physical disk is larger but selected
+        // partitions still fit on target.
+        if (!AllowSmallerTargetCheckBox.IsChecked.GetValueOrDefault())
         {
-            MessageBox.Show(
-                $"The target disk ({targetDisk.SizeDisplay}) is smaller than the source disk ({sourceDisk.SizeDisplay}).\n\n" +
-                "Enable 'Allow smaller target disk' in the Options tab if you want to proceed.",
-                "Target Too Small",
-                MessageBoxButton.OK,
-                MessageBoxImage.Warning);
-            return false;
+            var requiredBytes = CalculateRequiredTargetBytes(sourceDisk);
+            if (targetDisk.SizeBytes < requiredBytes)
+            {
+                MessageBox.Show(
+                    $"The target disk ({targetDisk.SizeDisplay}) is too small for the selected partitions.\n" +
+                    $"Required layout size: {FormatBytes(requiredBytes)}.\n\n" +
+                    "Either shrink selected source partitions more, choose a larger target, " +
+                    "or enable 'Allow smaller target disk'.",
+                    "Target Too Small",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+                return false;
+            }
         }
 
         return true;
+    }
+
+    private long CalculateRequiredTargetBytes(DiskInfo sourceDisk)
+    {
+        const long oneMiB = 1024L * 1024L;
+
+        var selectedPartitionNumbers = (PartitionsListBox.ItemsSource as IEnumerable<PartitionDisplayItem>)
+            ?.Where(item => item.IsSelected)
+            .Select(item => item.PartitionNumber)
+            .ToHashSet() ?? new HashSet<int>();
+
+        var partitions = sourceDisk.Partitions
+            .Where(p => selectedPartitionNumbers.Contains(p.PartitionNumber))
+            .ToList();
+
+        // Ensure boot-critical partitions are always counted, matching BuildCloneOperation behavior.
+        var efiPartition = sourceDisk.Partitions.FirstOrDefault(p => p.IsEfiPartition);
+        if (efiPartition != null && partitions.All(p => p.PartitionNumber != efiPartition.PartitionNumber))
+        {
+            partitions.Add(efiPartition);
+        }
+
+        var systemPartition = sourceDisk.Partitions.FirstOrDefault(p => p.IsSystemPartition);
+        if (systemPartition != null && partitions.All(p => p.PartitionNumber != systemPartition.PartitionNumber))
+        {
+            partitions.Add(systemPartition);
+        }
+
+        // Keep the same baseline formula as DiskClonerEngine.CalculateTargetLayout():
+        // 1 MiB base + each partition size + 1 MiB alignment buffer per partition.
+        var total = oneMiB;
+        foreach (var partition in partitions)
+        {
+            total += partition.SizeBytes;
+            total += oneMiB;
+        }
+
+        return Math.Max(total, 0);
     }
 
     private CloneOperation BuildCloneOperation(DiskInfo sourceDisk, DiskInfo targetDisk)

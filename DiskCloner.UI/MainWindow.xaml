@@ -117,11 +117,11 @@
                         </CheckBox>
 
                         <!-- Full Hash Verification -->
-                        <CheckBox x:Name="FullHashCheckBox" IsChecked="False" Margin="25,0,0,20">
+                        <CheckBox x:Name="FullHashCheckBox" IsChecked="True" Margin="25,0,0,20">
                             <TextBlock Text="Full hash verification (slower but more thorough)" TextWrapping="Wrap" FontSize="13"/>
                         </CheckBox>
                         <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
-                                   Text="When unchecked, only samples are verified for faster operation."/>
+                                   Text="Recommended: keep enabled for reliable verification."/>
 
                         <!-- Expand Partition Option -->
                         <CheckBox x:Name="AutoExpandCheckBox" IsChecked="True" Margin="0,0,0,15">

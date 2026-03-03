@@ -38,7 +38,7 @@ public class CloneOperation
     /// <summary>
     /// Whether to perform full hash verification (slow) or sampling (fast).
     /// </summary>
-    public bool FullHashVerification { get; set; } = false;
+    public bool FullHashVerification { get; set; } = true;
 
     /// <summary>
     /// Whether to automatically expand the Windows partition after cloning.

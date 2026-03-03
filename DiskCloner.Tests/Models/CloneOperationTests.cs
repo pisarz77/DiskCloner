@@ -18,7 +18,7 @@ public class CloneOperationTests
         Assert.True(operation.UseVss);
         Assert.Equal(64 * 1024 * 1024, operation.IoBufferSize); // 64MB default
         Assert.True(operation.VerifyIntegrity);
-        Assert.False(operation.FullHashVerification);
+        Assert.True(operation.FullHashVerification);
         Assert.True(operation.AutoExpandWindowsPartition);
         Assert.False(operation.AllowSmallerTarget);
         Assert.True(operation.StrictVerificationFailureStopsClone);

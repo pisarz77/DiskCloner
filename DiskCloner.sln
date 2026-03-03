@@ -1,4 +1,4 @@
-
+﻿
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
@@ -8,6 +8,8 @@ EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.Core", "DiskCloner.Core\DiskCloner.Core.csproj", "{9C5B2E6G-3F4D-5B8C-0G9E-2D3F4A5B6C7E}"
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.Tests", "DiskCloner.Tests\DiskCloner.Tests.csproj", "{7D3C4F9A-1B2E-5C8D-9E0F-2A3B4C5D6E7F}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "DiskCloner.VerifyHelper", "DiskCloner.VerifyHelper\DiskCloner.VerifyHelper.csproj", "{8837EBDA-FC01-4396-9C10-6B3399FC2600}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -23,5 +25,9 @@ Global
 		{9C5B2E6G-3F4D-5B8C-0G9E-2D3F4A5B6C7E}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{9C5B2E6G-3F4D-5B8C-0G9E-2D3F4A5B6C7E}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{9C5B2E6G-3F4D-5B8C-0G9E-2D3F4A5B6C7E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8837EBDA-FC01-4396-9C10-6B3399FC2600}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8837EBDA-FC01-4396-9C10-6B3399FC2600}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8837EBDA-FC01-4396-9C10-6B3399FC2600}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8837EBDA-FC01-4396-9C10-6B3399FC2600}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 EndGlobal
