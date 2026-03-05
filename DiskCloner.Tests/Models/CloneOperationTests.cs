@@ -16,11 +16,12 @@ public class CloneOperationTests
         Assert.NotNull(operation.PartitionsToClone);
         Assert.Empty(operation.PartitionsToClone);
         Assert.True(operation.UseVss);
+        Assert.Equal(SourceReadMode.LivePreferred, operation.SourceReadMode);
         Assert.Equal(64 * 1024 * 1024, operation.IoBufferSize); // 64MB default
         Assert.True(operation.VerifyIntegrity);
-        Assert.True(operation.FullHashVerification);
         Assert.True(operation.AutoExpandWindowsPartition);
         Assert.False(operation.AllowSmallerTarget);
+        Assert.True(operation.EnableQuietMode);
         Assert.True(operation.StrictVerificationFailureStopsClone);
         Assert.True(operation.UseSnapshotForFileMigration);
         Assert.Equal(string.Empty, operation.LogFilePath);
@@ -46,11 +47,12 @@ public class CloneOperationTests
             TargetDisk = targetDisk,
             PartitionsToClone = partitions,
             UseVss = false,
+            SourceReadMode = SourceReadMode.SnapshotRawStrict,
             IoBufferSize = 32 * 1024 * 1024, // 32MB
             VerifyIntegrity = false,
-            FullHashVerification = true,
             AutoExpandWindowsPartition = false,
             AllowSmallerTarget = true,
+            EnableQuietMode = false,
             StrictVerificationFailureStopsClone = false,
             UseSnapshotForFileMigration = false,
             LogFilePath = @"C:\logs\clone.log"
@@ -61,11 +63,12 @@ public class CloneOperationTests
         Assert.Equal(targetDisk, operation.TargetDisk);
         Assert.Equal(partitions, operation.PartitionsToClone);
         Assert.False(operation.UseVss);
+        Assert.Equal(SourceReadMode.SnapshotRawStrict, operation.SourceReadMode);
         Assert.Equal(32 * 1024 * 1024, operation.IoBufferSize);
         Assert.False(operation.VerifyIntegrity);
-        Assert.True(operation.FullHashVerification);
         Assert.False(operation.AutoExpandWindowsPartition);
         Assert.True(operation.AllowSmallerTarget);
+        Assert.False(operation.EnableQuietMode);
         Assert.False(operation.StrictVerificationFailureStopsClone);
         Assert.False(operation.UseSnapshotForFileMigration);
         Assert.Equal(@"C:\logs\clone.log", operation.LogFilePath);
@@ -221,8 +224,10 @@ public class CloneResultTests
         Assert.False(result.TargetMarkedIncomplete);
         Assert.NotNull(result.NextSteps);
         Assert.NotNull(result.Warnings);
+        Assert.NotNull(result.HealthChecks);
         Assert.Empty(result.NextSteps);
         Assert.Empty(result.Warnings);
+        Assert.Empty(result.HealthChecks);
     }
 
     [Fact]
@@ -250,7 +255,8 @@ public class CloneResultTests
                 "Swap drives",
                 "Boot from new drive"
             },
-            Warnings = new List<string> { "test warning" }
+            Warnings = new List<string> { "test warning" },
+            HealthChecks = new List<string> { "Partition mapping: OK" }
         };
 
         // Assert
@@ -266,6 +272,7 @@ public class CloneResultTests
         Assert.False(result.TargetMarkedIncomplete);
         Assert.Equal(3, result.NextSteps.Count);
         Assert.Single(result.Warnings);
+        Assert.Single(result.HealthChecks);
         Assert.Contains("Shutdown computer", result.NextSteps);
         Assert.Contains("Swap drives", result.NextSteps);
         Assert.Contains("Boot from new drive", result.NextSteps);

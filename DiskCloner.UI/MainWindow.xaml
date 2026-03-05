@@ -111,17 +111,23 @@
                         <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
                                    Text="Creates a consistent snapshot of the source disk. Recommended for system clones."/>
 
+                        <TextBlock Text="Source read mode:" Margin="0,0,0,5"/>
+                        <ComboBox x:Name="SourceReadModeComboBox" Width="420" Margin="0,0,0,20" SelectedIndex="0" SelectionChanged="SourceReadModeComboBox_SelectionChanged">
+                            <ComboBoxItem Content="Live (current behavior, faster, less deterministic)"/>
+                            <ComboBoxItem Content="VSS snapshot (raw, strict; no smart copy fallback)"/>
+                        </ComboBox>
+
+                        <!-- Quiet Mode Option -->
+                        <CheckBox x:Name="QuietModeCheckBox" IsChecked="True" Margin="0,0,0,15">
+                            <TextBlock Text="Quiet mode before snapshot (pause background writers)" TextWrapping="Wrap"/>
+                        </CheckBox>
+                        <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
+                                   Text="Temporarily pauses selected update/search services and OneDrive sync before clone start; services are restored automatically after clone."/>
+
                         <!-- Verification Option -->
                         <CheckBox x:Name="VerifyIntegrityCheckBox" IsChecked="True" Margin="0,0,0,15">
                             <TextBlock Text="Verify data integrity after copy" TextWrapping="Wrap"/>
                         </CheckBox>
-
-                        <!-- Full Hash Verification -->
-                        <CheckBox x:Name="FullHashCheckBox" IsChecked="True" Margin="25,0,0,20">
-                            <TextBlock Text="Full hash verification (slower but more thorough)" TextWrapping="Wrap" FontSize="13"/>
-                        </CheckBox>
-                        <TextBlock FontSize="12" Foreground="Gray" TextWrapping="Wrap" Margin="25,0,0,20"
-                                   Text="Recommended: keep enabled for reliable verification."/>
 
                         <!-- Expand Partition Option -->
                         <CheckBox x:Name="AutoExpandCheckBox" IsChecked="True" Margin="0,0,0,15">

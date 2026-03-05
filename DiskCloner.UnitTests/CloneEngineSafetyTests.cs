@@ -39,6 +39,32 @@ public class CloneEngineSafetyTests
     }
 
     [Fact]
+    public void ApplyTargetPartitionOffsets_AllowsEqualRoundedOffsets_FromDiskpartText()
+    {
+        var engine = CreateEngine();
+        var operation = CreateOperationForMapping();
+
+        // DiskPart text output may round both recovery offsets to the same GB value.
+        var targetPartitions = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>
+        {
+            (1, "Reserved", 15L * 1024 * 1024, 17L * 1024),
+            (2, "System", 100L * 1024 * 1024, 16L * 1024 * 1024),
+            (3, "Primary", 236L * 1024 * 1024 * 1024, 116L * 1024 * 1024),
+            (4, "Recovery", 533L * 1024 * 1024, 237L * 1024 * 1024 * 1024),
+            (5, "Recovery", 768L * 1024 * 1024, 237L * 1024 * 1024 * 1024)
+        };
+
+        InvokePrivate(
+            engine,
+            "ApplyTargetPartitionOffsets",
+            new object[] { operation, targetPartitions });
+
+        var recs = operation.PartitionsToClone.Where(p => p.IsRecoveryPartition).OrderBy(p => p.StartingOffset).ToList();
+        Assert.Equal(4, recs[0].TargetPartitionNumber);
+        Assert.Equal(5, recs[1].TargetPartitionNumber);
+    }
+
+    [Fact]
     public void EnsureTargetDiskMutationAllowed_RejectsSourceDisk()
     {
         var engine = CreateEngine();

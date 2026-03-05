@@ -25,6 +25,19 @@ A Windows 10/11 system disk cloning application that clones the currently runnin
 dotnet build DiskCloner.sln
 ```
 
+## Publishing (Single File)
+
+Use the repository script to publish a single-file release and automatically clean old `publish_*` folders:
+
+```powershell
+.\publish-release.ps1 -KeepLatest 2
+```
+
+Result:
+- creates a new `publish\publish_YYYYMMDD_fixN` folder
+- outputs a single executable (`DiskCloner.UI.exe`)
+- keeps only the newest N publish folders
+
 ## Running
 
 ```bash

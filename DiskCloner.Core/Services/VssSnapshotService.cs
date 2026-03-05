@@ -20,6 +20,9 @@ public class VssSnapshotService : IDisposable
     private Guid _snapshotSetId = Guid.Empty;
     private bool _disposed;
 
+    public string LastCleanupStatus { get; private set; } = "NotAttempted";
+    public string LastCleanupMessage { get; private set; } = string.Empty;
+
     public VssSnapshotService(ILogger? logger)
     {
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
@@ -340,6 +343,9 @@ public class VssSnapshotService : IDisposable
     public async Task DeleteSnapshotsAsync()
 
     {
+        LastCleanupStatus = "Skipped";
+        LastCleanupMessage = "No active snapshot set.";
+
         if (_backupComponents == null || _snapshotSetId == Guid.Empty)
             return;
 
@@ -362,7 +368,14 @@ public class VssSnapshotService : IDisposable
                             }
                             catch (Exception ex)
                             {
-                                _logger.Warning($"Failed to unexpose snapshot {snapshotId}: {ex.Message}");
+                                if (IsBenignSnapshotCleanupException(ex))
+                                {
+                                    _logger.Info($"Snapshot {snapshotId} was already unexposed or unavailable: {ex.Message}");
+                                }
+                                else
+                                {
+                                    _logger.Warning($"Failed to unexpose snapshot {snapshotId}: {ex.Message}");
+                                }
                             }
                         }
                     }
@@ -379,10 +392,23 @@ public class VssSnapshotService : IDisposable
                     _backupComponents.BackupComplete();
                     _backupComponents.DeleteSnapshotSet(_snapshotSetId, true);
                     _logger.Info("VSS snapshot set deleted successfully");
+                    LastCleanupStatus = "Deleted";
+                    LastCleanupMessage = "Snapshot set deleted successfully.";
                 }
                 catch (Exception ex)
                 {
-                    _logger.Warning($"Failed to delete VSS snapshot set: {ex.Message}");
+                    if (IsBenignSnapshotCleanupException(ex))
+                    {
+                        _logger.Info($"VSS snapshot cleanup skipped benignly: {ex.Message}");
+                        LastCleanupStatus = "SkippedBenign";
+                        LastCleanupMessage = ex.Message;
+                    }
+                    else
+                    {
+                        _logger.Warning($"Failed to delete VSS snapshot set: {ex.Message}");
+                        LastCleanupStatus = "Failed";
+                        LastCleanupMessage = ex.Message;
+                    }
                 }
                 finally
                 {
@@ -398,6 +424,8 @@ public class VssSnapshotService : IDisposable
         catch (Exception ex)
         {
             _logger.Error("Error during native snapshot deletion", ex);
+            LastCleanupStatus = "Failed";
+            LastCleanupMessage = ex.Message;
         }
     }
 
@@ -548,5 +576,14 @@ public class VssSnapshotService : IDisposable
         }
 
         throw new IOException("No free drive letter available to expose VSS snapshot.");
+    }
+
+    private static bool IsBenignSnapshotCleanupException(Exception ex)
+    {
+        var message = ex.Message ?? string.Empty;
+        return message.Contains("incorrect state", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("requested object does not exist", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("not exist", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("already", StringComparison.OrdinalIgnoreCase);
     }
 }

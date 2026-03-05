@@ -66,6 +66,7 @@ public partial class MainWindow : Window
     {
         StatusTextBlock.Text = "Loading disk information...";
         await RefreshDisksAsync();
+        UpdateSourceReadModeUiConstraints();
         MainTabControl.SelectedIndex = 0;
         StatusTextBlock.Text = "Ready";
     }
@@ -218,6 +219,11 @@ public partial class MainWindow : Window
         UpdateSummary();
     }
 
+    private void SourceReadModeComboBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        UpdateSourceReadModeUiConstraints();
+    }
+
     private void ConfirmationTextBox_TextChanged(object sender, System.Windows.Controls.TextChangedEventArgs e)
     {
         UpdateCloneButtonState();
@@ -357,10 +363,18 @@ public partial class MainWindow : Window
             {
                 ThroughputTextBlock.Text = $"Speed: {progress.ThroughputDisplay}";
             }
+            else
+            {
+                ThroughputTextBlock.Text = "Speed: --";
+            }
 
             if (progress.EstimatedTimeRemaining.TotalSeconds > 0)
             {
                 RemainingTimeTextBlock.Text = $"Estimated: {FormatTimeSpan(progress.EstimatedTimeRemaining)}";
+            }
+            else
+            {
+                RemainingTimeTextBlock.Text = "Estimated: --";
             }
 
             if (progress.LastError != null)
@@ -376,8 +390,9 @@ public partial class MainWindow : Window
         TargetDiskComboBox.IsEnabled = enabled;
         PartitionsListBox.IsEnabled = enabled;
         UseVssCheckBox.IsEnabled = enabled;
+        SourceReadModeComboBox.IsEnabled = enabled;
+        QuietModeCheckBox.IsEnabled = enabled;
         VerifyIntegrityCheckBox.IsEnabled = enabled;
-        FullHashCheckBox.IsEnabled = enabled;
         AutoExpandCheckBox.IsEnabled = enabled;
         SmartCopyCheckBox.IsEnabled = enabled;
         AllowSmallerTargetCheckBox.IsEnabled = enabled;
@@ -386,6 +401,7 @@ public partial class MainWindow : Window
         ConfirmationTextBox.IsEnabled = enabled;
         if (enabled)
         {
+            UpdateSourceReadModeUiConstraints();
             UpdateCloneButtonState();
         }
         else
@@ -454,6 +470,26 @@ public partial class MainWindow : Window
         sb.AppendLine($"Integrity Verified: {(result.IntegrityVerified ? "Yes" : "No")}");
         sb.AppendLine($"Bootable: {(result.IsBootable ? "Yes" : "No")}");
         sb.AppendLine($"Boot Mode: {result.BootMode}");
+
+        if (result.HealthChecks.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Health Checks:");
+            foreach (var line in result.HealthChecks)
+            {
+                sb.AppendLine($"• {line}");
+            }
+        }
+
+        if (result.Warnings.Count > 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("Warnings:");
+            foreach (var warning in result.Warnings)
+            {
+                sb.AppendLine($"• {warning}");
+            }
+        }
 
         if (!string.IsNullOrEmpty(result.ErrorMessage))
         {
@@ -646,13 +682,18 @@ public partial class MainWindow : Window
 
     private CloneOperation BuildCloneOperation(DiskInfo sourceDisk, DiskInfo targetDisk)
     {
+        var selectedReadMode = SourceReadModeComboBox.SelectedIndex == 1
+            ? SourceReadMode.SnapshotRawStrict
+            : SourceReadMode.LivePreferred;
+
         var operation = new CloneOperation
         {
             SourceDisk = sourceDisk,
             TargetDisk = targetDisk,
             UseVss = UseVssCheckBox.IsChecked.GetValueOrDefault(),
+            SourceReadMode = selectedReadMode,
+            EnableQuietMode = QuietModeCheckBox.IsChecked.GetValueOrDefault(),
             VerifyIntegrity = VerifyIntegrityCheckBox.IsChecked.GetValueOrDefault(),
-            FullHashVerification = FullHashCheckBox.IsChecked.GetValueOrDefault(),
             AutoExpandWindowsPartition = AutoExpandCheckBox.IsChecked.GetValueOrDefault(),
             AllowSmallerTarget = AllowSmallerTargetCheckBox.IsChecked.GetValueOrDefault(),
             SmartCopy = SmartCopyCheckBox.IsChecked.GetValueOrDefault(),
@@ -702,6 +743,31 @@ public partial class MainWindow : Window
         operation.PartitionsToClone = operation.PartitionsToClone.OrderBy(p => p.StartingOffset).ToList();
 
         return operation;
+    }
+
+    private void UpdateSourceReadModeUiConstraints()
+    {
+        if (SourceReadModeComboBox is null || UseVssCheckBox is null || SmartCopyCheckBox is null)
+        {
+            return;
+        }
+
+        var strictSnapshot = SourceReadModeComboBox.SelectedIndex == 1;
+        if (strictSnapshot)
+        {
+            UseVssCheckBox.IsChecked = true;
+            UseVssCheckBox.IsEnabled = false;
+            SmartCopyCheckBox.IsChecked = false;
+            SmartCopyCheckBox.IsEnabled = false;
+        }
+        else
+        {
+            if (!_isCloning)
+            {
+                UseVssCheckBox.IsEnabled = true;
+                SmartCopyCheckBox.IsEnabled = true;
+            }
+        }
     }
 
     private static string FormatBytes(long bytes)

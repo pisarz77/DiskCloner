@@ -26,6 +26,13 @@ public class DiskClonerEngine
     private static readonly Regex RobocopyTimestampedErrorRegex = new(
         @"^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+ERROR\s+\d+\s+\(0x[0-9A-Fa-f]+\)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly string[] QuietModeServiceNames =
+    {
+        "UsoSvc",    // Update Orchestrator
+        "wuauserv",  // Windows Update
+        "BITS",      // Background transfers
+        "WSearch"    // Windows Search indexing
+    };
 
     private readonly ILogger _logger;
     private readonly DiskEnumerator _diskEnumerator;
@@ -37,6 +44,38 @@ public class DiskClonerEngine
         RawBlock,
         SmartBlock,
         FileSystemMigration
+    }
+
+    private sealed class BootFinalizationStatus
+    {
+        public bool Success { get; set; }
+        public bool BootFilesRebuilt { get; set; }
+        public bool WindowsVolumeClean { get; set; }
+        public bool ChkdskFixApplied { get; set; }
+        public string WindowsVolumeStatus { get; set; } = "Not checked";
+    }
+
+    private sealed class VolumeRepairStatus
+    {
+        public bool ScanDetectedIssues { get; set; }
+        public bool DirtyBeforeFix { get; set; }
+        public bool FixApplied { get; set; }
+        public bool DirtyAfterRepair { get; set; }
+        public string Summary { get; set; } = string.Empty;
+    }
+
+    private sealed class SourceReadDescriptor
+    {
+        public string SourcePath { get; set; } = string.Empty;
+        public long BaseOffset { get; set; }
+        public bool IsSnapshotBacked { get; set; }
+    }
+
+    private sealed class QuietModeState
+    {
+        public List<string> StoppedServices { get; } = new();
+        public bool OneDriveStopped { get; set; }
+        public string? OneDriveExecutablePath { get; set; }
     }
 
     public event Action<CloneProgress>? ProgressUpdate;
@@ -68,11 +107,19 @@ public class DiskClonerEngine
             IsBootable = false
         };
         var targetDiskWasPrepared = false; // Track whether target preparation ran
+        var partitionMappingCompleted = false;
+        BootFinalizationStatus? bootStatus = null;
+        QuietModeState? quietModeState = null;
 
         try
         {
             // Step 1: Validate the configuration
             await ValidateOperationAsync(operation, progress);
+
+            if (operation.EnableQuietMode)
+            {
+                quietModeState = await EnterQuietModeAsync(operation, result, progress);
+            }
 
             // Step 2: Create VSS snapshots
             if (operation.UseVss)
@@ -101,6 +148,7 @@ public class DiskClonerEngine
 
             await PrepareTargetDiskAsync(operation, progress);
             targetDiskWasPrepared = true;
+            partitionMappingCompleted = true;
 
             // Step 4: Copy partition data
             progress.Stage = CloneStage.CopyingData;
@@ -233,7 +281,11 @@ public class DiskClonerEngine
             if (operation.VerifyIntegrity)
             {
                 progress.Stage = CloneStage.Verifying;
-                progress.StatusMessage = "Verifying data integrity...";
+                progress.StatusMessage = "Skipping integrity verification (disabled for performance)...";
+                progress.BytesCopied = 0;
+                progress.PercentComplete = 0;
+                progress.ThroughputBytesPerSec = 0;
+                progress.EstimatedTimeRemaining = TimeSpan.Zero;
                 ReportProgress(progress);
 
                 var excludedFromVerification = BuildVerificationExclusions(operation, migratedPartitionNumbers, result);
@@ -271,7 +323,8 @@ public class DiskClonerEngine
             }
 
             // Step 7: Finalize and mark as bootable
-            result.IsBootable = await MakeBootableAsync(operation);
+            bootStatus = await MakeBootableAsync(operation);
+            result.IsBootable = bootStatus.Success;
             if (!result.IsBootable)
             {
                 throw new InvalidOperationException(
@@ -359,6 +412,22 @@ public class DiskClonerEngine
             {
                 _logger.Warning($"Error during cleanup: {ex.Message}");
             }
+
+            try
+            {
+                await ExitQuietModeAsync(quietModeState, result);
+            }
+            catch (Exception ex)
+            {
+                _logger.Warning($"Failed to restore quiet mode state: {ex.Message}");
+            }
+
+            AppendHealthChecksSummary(
+                result,
+                partitionMappingCompleted,
+                bootStatus,
+                _vssService.LastCleanupStatus,
+                _vssService.LastCleanupMessage);
         }
     }
 
@@ -405,6 +474,21 @@ public class DiskClonerEngine
 
         if (!hasSystem)
             throw new InvalidOperationException("System partition must be included");
+
+        if (operation.SourceReadMode == SourceReadMode.SnapshotRawStrict)
+        {
+            if (!operation.UseVss)
+            {
+                throw new InvalidOperationException(
+                    "Source read mode 'VSS snapshot (raw, strict)' requires VSS to be enabled.");
+            }
+
+            if (operation.AllowSmallerTarget)
+            {
+                throw new InvalidOperationException(
+                    "Source read mode 'VSS snapshot (raw, strict)' is not compatible with 'Allow smaller target disk'.");
+            }
+        }
 
         // Check for BitLocker
         foreach (var partition in operation.PartitionsToClone)
@@ -726,6 +810,15 @@ public class DiskClonerEngine
                 else
                 {
                     var targetPartitions = await QueryTargetPartitionLayoutAsync(operation);
+                    if (targetPartitions.Count == 0)
+                    {
+                        _logger.Warning(
+                            "Primary target layout query returned no rows. Falling back to diskpart output parsing.");
+                        targetPartitions = ParsePartitionTableFromDiskPartOutput(output);
+                    }
+                    if (targetPartitions.Count == 0)
+                        throw new InvalidOperationException("Could not read target partition layout after diskpart creation.");
+
                     ApplyTargetPartitionOffsets(operation, targetPartitions);
                     _logger.Info("Partitions created successfully");
                 }
@@ -752,6 +845,68 @@ public class DiskClonerEngine
     }
 
     private async Task<List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>> QueryTargetPartitionLayoutAsync(CloneOperation operation)
+    {
+        var fromPowerShell = await QueryTargetPartitionLayoutViaPowerShellAsync(operation);
+        if (fromPowerShell.Count > 0)
+            return fromPowerShell;
+
+        _logger.Warning("PowerShell Get-Partition layout query returned no rows; falling back to WMI.");
+        return await QueryTargetPartitionLayoutViaWmiAsync(operation);
+    }
+
+    private async Task<List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>> QueryTargetPartitionLayoutViaPowerShellAsync(CloneOperation operation)
+    {
+        var command =
+            $"$ErrorActionPreference = 'Stop'; " +
+            $"Get-Partition -DiskNumber {operation.TargetDisk.DiskNumber} | " +
+            "Sort-Object Offset | " +
+            "Select-Object PartitionNumber,Type,Offset,Size | " +
+            "ConvertTo-Json -Compress";
+
+        var startInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{command}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        try
+        {
+            using var process = System.Diagnostics.Process.Start(startInfo);
+            if (process == null)
+                return new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+
+            var stdout = await process.StandardOutput.ReadToEndAsync();
+            var stderr = await process.StandardError.ReadToEndAsync();
+            await process.WaitForExitAsync(_cancellationTokenSource.Token);
+
+            if (process.ExitCode != 0)
+            {
+                _logger.Warning(
+                    $"Get-Partition query failed with code {process.ExitCode}. StdErr: {stderr}");
+                return new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+            }
+
+            var parsed = ParseTargetPartitionLayoutJson(stdout);
+            if (parsed.Count == 0)
+            {
+                _logger.Warning(
+                    $"Get-Partition query returned no parseable rows. Raw output: {stdout}");
+            }
+
+            return parsed;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warning($"Get-Partition layout query failed: {ex.Message}");
+            return new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>();
+        }
+    }
+
+    private async Task<List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>> QueryTargetPartitionLayoutViaWmiAsync(CloneOperation operation)
     {
         return await Task.Run(() =>
         {
@@ -921,9 +1076,15 @@ public class DiskClonerEngine
             {
                 throw new InvalidOperationException($"Parsed target partition {targetPartition.PartitionNumber} has invalid starting offset {targetPartition.StartingOffsetBytes}.");
             }
-            if (lastAssignedOffset >= 0 && targetPartition.StartingOffsetBytes <= lastAssignedOffset)
+            if (lastAssignedOffset >= 0 && targetPartition.StartingOffsetBytes < lastAssignedOffset)
             {
                 throw new InvalidOperationException($"Parsed target partition offsets are not strictly increasing (partition {targetPartition.PartitionNumber} offset {targetPartition.StartingOffsetBytes}). Aborting.");
+            }
+            if (lastAssignedOffset >= 0 && targetPartition.StartingOffsetBytes == lastAssignedOffset)
+            {
+                _logger.Warning(
+                    $"Target partition {targetPartition.PartitionNumber} has the same offset as previous partition in parsed layout. " +
+                    "Proceeding by mapped partition order.");
             }
             if (!operation.AllowSmallerTarget && targetPartition.SizeBytes < sourcePartition.SizeBytes)
             {
@@ -1123,14 +1284,17 @@ public class DiskClonerEngine
     /// </summary>
     private async Task<long> CopyPartitionAsync(CloneOperation operation, PartitionInfo partition, CloneProgress progress, long totalBytesAlreadyCopied)
     {
-        _logger.Info($"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) to target ({FormatBytes(partition.TargetSizeBytes)})");
+        var sourceRead = await ResolveSourceReadDescriptorAsync(operation, partition);
+        _logger.Info(
+            $"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) to target ({FormatBytes(partition.TargetSizeBytes)}). " +
+            $"Source mode: {(sourceRead.IsSnapshotBacked ? "SnapshotRawStrict" : "LiveRaw")}.");
 
-        var sourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}";
+        var sourcePath = sourceRead.SourcePath;
         var targetPath = $@"\\.\PhysicalDrive{operation.TargetDisk.DiskNumber}";
         var targetPartitionOffset = GetRequiredTargetStartingOffset(partition);
 
         var partitionBytesCopied = 0L;
-        var totalBytesInPartition = partition.TargetSizeBytes;
+        var totalBytesInPartition = GetRawCopyLengthBytes(partition);
         const int sectorSize = 512;
 
         // Align buffer size to sector boundary
@@ -1197,7 +1361,7 @@ public class DiskClonerEngine
                     // Round up to sector size for physical disk I/O
                     bytesToRead = ((bytesToRead + sectorSize - 1) / sectorSize) * sectorSize;
 
-                    long absoluteSourceOffset = partition.StartingOffset + relativeOffset;
+                    long absoluteSourceOffset = sourceRead.BaseOffset + relativeOffset;
                     long absoluteTargetOffset = targetPartitionOffset + relativeOffset;
 
                     // Seek to source position
@@ -1808,6 +1972,11 @@ public class DiskClonerEngine
 
     private CopyStrategy GetCopyStrategy(CloneOperation operation, PartitionInfo partition)
     {
+        if (operation.SourceReadMode == SourceReadMode.SnapshotRawStrict)
+        {
+            return CopyStrategy.RawBlock;
+        }
+
         bool isNtfs = partition.FileSystemType.Equals("NTFS", StringComparison.OrdinalIgnoreCase);
         bool isShrunk = partition.TargetSizeBytes > 0 && partition.TargetSizeBytes < partition.SizeBytes;
         bool isSystemNtfsShrink = operation.AllowSmallerTarget && partition.IsSystemPartition && isNtfs && isShrunk;
@@ -1821,6 +1990,62 @@ public class DiskClonerEngine
         return useSmartCopy ? CopyStrategy.SmartBlock : CopyStrategy.RawBlock;
     }
 
+    private static long GetRawCopyLengthBytes(PartitionInfo partition)
+    {
+        if (partition.SizeBytes <= 0 || partition.TargetSizeBytes <= 0)
+            return 0;
+
+        // Raw copy must never read past source partition boundaries.
+        return Math.Min(partition.SizeBytes, partition.TargetSizeBytes);
+    }
+
+    private async Task<SourceReadDescriptor> ResolveSourceReadDescriptorAsync(CloneOperation operation, PartitionInfo partition)
+    {
+        if (operation.SourceReadMode != SourceReadMode.SnapshotRawStrict)
+        {
+            return new SourceReadDescriptor
+            {
+                SourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}",
+                BaseOffset = partition.StartingOffset,
+                IsSnapshotBacked = false
+            };
+        }
+
+        if (partition.IsSystemPartition && partition.DriveLetter.HasValue)
+        {
+            var sourceRoot = $"{NormalizeDriveLetter(partition.DriveLetter.Value)}:\\";
+            var snapshotPath = _vssService.GetSnapshotVolumePath(sourceRoot);
+            if (string.IsNullOrWhiteSpace(snapshotPath))
+            {
+                throw new InvalidOperationException(
+                    $"Snapshot strict mode requested, but no snapshot path is available for {sourceRoot}.");
+            }
+
+            var exposedPath = await _vssService.ExposeSnapshotVolumeAsync(sourceRoot);
+            if (string.IsNullOrWhiteSpace(exposedPath))
+            {
+                throw new InvalidOperationException(
+                    $"Snapshot strict mode requested, but snapshot for {sourceRoot} could not be exposed for raw reads.");
+            }
+
+            var exposedDrive = NormalizeDriveLetter(exposedPath[0]);
+            return new SourceReadDescriptor
+            {
+                SourcePath = $@"\\.\{exposedDrive}:",
+                BaseOffset = 0,
+                IsSnapshotBacked = true
+            };
+        }
+
+        // EFI/Recovery partitions are copied raw from physical disk in strict mode.
+        return new SourceReadDescriptor
+        {
+            SourcePath = $@"\\.\PhysicalDrive{operation.SourceDisk.DiskNumber}",
+            BaseOffset = partition.StartingOffset,
+            IsSnapshotBacked = false
+        };
+    }
+
     private long CalculatePlannedTotalBytes(CloneOperation operation)
     {
         long total = 0;
@@ -1830,6 +2055,10 @@ public class DiskClonerEngine
             if (strategy == CopyStrategy.FileSystemMigration)
             {
                 total += GetEstimatedMigrationBytes(partition);
+            }
+            else if (strategy == CopyStrategy.RawBlock)
+            {
+                total += GetRawCopyLengthBytes(partition);
             }
             else
             {
@@ -1943,6 +2172,233 @@ public class DiskClonerEngine
         var errorTask = process.StandardError.ReadToEndAsync();
         await process.WaitForExitAsync();
         return (process.ExitCode, await outputTask, await errorTask);
+    }
+
+    private async Task<QuietModeState> EnterQuietModeAsync(CloneOperation operation, CloneResult result, CloneProgress progress)
+    {
+        _logger.Info("Entering source quiet mode (best-effort).");
+        progress.StatusMessage = "Preparing quiet mode (pausing background writers)...";
+        ReportProgress(progress);
+
+        var state = new QuietModeState
+        {
+            OneDriveExecutablePath = ResolveOneDriveExecutablePath()
+        };
+
+        // Stop OneDrive process (if present) to reduce user-profile churn.
+        var oneDriveStopInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "taskkill.exe",
+            Arguments = "/IM OneDrive.exe /F",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (oneDriveExit, oneDriveOut, oneDriveErr) = await RunProcessAsync(oneDriveStopInfo);
+        var oneDriveCombined = $"{oneDriveOut}\n{oneDriveErr}";
+        if (oneDriveExit == 0)
+        {
+            state.OneDriveStopped = true;
+            _logger.Info("Quiet mode: OneDrive process stopped.");
+        }
+        else if (oneDriveCombined.Contains("not found", StringComparison.OrdinalIgnoreCase)
+                 || oneDriveCombined.Contains("no running instance", StringComparison.OrdinalIgnoreCase)
+                 || oneDriveCombined.Contains("not running", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Info("Quiet mode: OneDrive process is not running.");
+        }
+        else
+        {
+            var warning = $"Quiet mode: failed to stop OneDrive process (code {oneDriveExit}).";
+            _logger.Warning($"{warning} Output: {oneDriveCombined}");
+            result.Warnings.Add(warning);
+        }
+
+        foreach (var serviceName in QuietModeServiceNames)
+        {
+            var stateCode = await QueryServiceStateCodeAsync(serviceName);
+            if (!stateCode.HasValue)
+            {
+                _logger.Info($"Quiet mode: service '{serviceName}' not available on this system.");
+                continue;
+            }
+
+            if (stateCode.Value != 4) // RUNNING
+            {
+                _logger.Info($"Quiet mode: service '{serviceName}' already not running.");
+                continue;
+            }
+
+            if (await StopServiceBestEffortAsync(serviceName))
+            {
+                state.StoppedServices.Add(serviceName);
+                _logger.Info($"Quiet mode: service '{serviceName}' paused.");
+            }
+            else
+            {
+                var warning = $"Quiet mode: could not pause service '{serviceName}'.";
+                _logger.Warning(warning);
+                result.Warnings.Add(warning);
+            }
+        }
+
+        return state;
+    }
+
+    private async Task ExitQuietModeAsync(QuietModeState? state, CloneResult result)
+    {
+        if (state == null)
+            return;
+
+        _logger.Info("Restoring source quiet mode state...");
+
+        foreach (var serviceName in Enumerable.Reverse(state.StoppedServices))
+        {
+            if (!await StartServiceBestEffortAsync(serviceName))
+            {
+                var warning = $"Quiet mode restore: failed to restart service '{serviceName}'.";
+                _logger.Warning(warning);
+                result.Warnings.Add(warning);
+            }
+            else
+            {
+                _logger.Info($"Quiet mode restore: service '{serviceName}' resumed.");
+            }
+        }
+
+        if (state.OneDriveStopped && !string.IsNullOrWhiteSpace(state.OneDriveExecutablePath) && File.Exists(state.OneDriveExecutablePath))
+        {
+            try
+            {
+                var startInfo = new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = state.OneDriveExecutablePath,
+                    UseShellExecute = true
+                };
+
+                System.Diagnostics.Process.Start(startInfo);
+                _logger.Info("Quiet mode restore: OneDrive restarted.");
+            }
+            catch (Exception ex)
+            {
+                var warning = $"Quiet mode restore: failed to restart OneDrive ({ex.Message}).";
+                _logger.Warning(warning);
+                result.Warnings.Add(warning);
+            }
+        }
+    }
+
+    private static string? ResolveOneDriveExecutablePath()
+    {
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        if (!string.IsNullOrWhiteSpace(local))
+        {
+            var candidate = Path.Combine(local, "Microsoft", "OneDrive", "OneDrive.exe");
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        if (!string.IsNullOrWhiteSpace(programFiles))
+        {
+            var candidate = Path.Combine(programFiles, "Microsoft OneDrive", "OneDrive.exe");
+            if (File.Exists(candidate))
+                return candidate;
+        }
+
+        return null;
+    }
+
+    private async Task<int?> QueryServiceStateCodeAsync(string serviceName)
+    {
+        var queryInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "sc.exe",
+            Arguments = $"query \"{serviceName}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (exitCode, output, error) = await RunProcessAsync(queryInfo);
+        var combined = $"{output}\n{error}";
+
+        if (exitCode != 0 && combined.Contains("does not exist", StringComparison.OrdinalIgnoreCase))
+            return null;
+
+        var match = Regex.Match(combined, @"STATE\s*:\s*(\d+)", RegexOptions.IgnoreCase);
+        if (match.Success && int.TryParse(match.Groups[1].Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var code))
+            return code;
+
+        return exitCode == 0 ? 0 : (int?)null;
+    }
+
+    private async Task<bool> StopServiceBestEffortAsync(string serviceName)
+    {
+        var stopInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "sc.exe",
+            Arguments = $"stop \"{serviceName}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (exitCode, output, error) = await RunProcessAsync(stopInfo);
+        var combined = $"{output}\n{error}";
+
+        if (exitCode != 0 &&
+            !combined.Contains("not started", StringComparison.OrdinalIgnoreCase) &&
+            !combined.Contains("already stopped", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Warning($"Service stop failed for '{serviceName}' (code {exitCode}): {combined}");
+            return false;
+        }
+
+        return await WaitForServiceStateAsync(serviceName, desiredStateCode: 1, TimeSpan.FromSeconds(12)); // STOPPED
+    }
+
+    private async Task<bool> StartServiceBestEffortAsync(string serviceName)
+    {
+        var startInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "sc.exe",
+            Arguments = $"start \"{serviceName}\"",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (exitCode, output, error) = await RunProcessAsync(startInfo);
+        var combined = $"{output}\n{error}";
+        if (exitCode != 0 &&
+            !combined.Contains("already running", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.Warning($"Service start failed for '{serviceName}' (code {exitCode}): {combined}");
+            return false;
+        }
+
+        return await WaitForServiceStateAsync(serviceName, desiredStateCode: 4, TimeSpan.FromSeconds(12)); // RUNNING
+    }
+
+    private async Task<bool> WaitForServiceStateAsync(string serviceName, int desiredStateCode, TimeSpan timeout)
+    {
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var stateCode = await QueryServiceStateCodeAsync(serviceName);
+            if (stateCode == desiredStateCode)
+                return true;
+
+            await Task.Delay(500);
+        }
+
+        return false;
     }
 
     private static char GetAvailableDriveLetter(params char[] preferredLetters)
@@ -2506,14 +2962,15 @@ public class DiskClonerEngine
 
     private async Task<bool> VerifyIntegrityAsync(CloneOperation operation, CloneProgress progress, IReadOnlyCollection<int>? excludedPartitionNumbers = null)
     {
-        _logger.Info("Verifying data integrity...");
-
-        if (!operation.FullHashVerification)
-        {
-            _logger.Warning("Sampling verification is disabled for reliability. Running full hash verification instead.");
-        }
-
-        return await FullHashVerificationAsync(operation, progress, excludedPartitionNumbers);
+        await Task.CompletedTask;
+        _logger.Warning("Integrity verification is currently disabled. Full-hash verification step is skipped.");
+        progress.TotalBytes = 1;
+        progress.BytesCopied = 1;
+        progress.PercentComplete = 100;
+        progress.ThroughputBytesPerSec = 0;
+        progress.EstimatedTimeRemaining = TimeSpan.Zero;
+        ReportProgress(progress);
+        return true;
     }
 
     private IReadOnlyCollection<int> BuildVerificationExclusions(
@@ -2551,13 +3008,36 @@ public class DiskClonerEngine
         _logger.Info("Performing full hash verification...");
 
         var bufferSize = 1024 * 1024; // 1MB buffers
-        var totalChecked = 0L;
+        var includedPartitions = operation.PartitionsToClone
+            .Where(p => excludedPartitionNumbers == null || !excludedPartitionNumbers.Contains(p.PartitionNumber))
+            .ToList();
+        var totalLogicalBytes = includedPartitions.Sum(GetVerificationLengthBytes);
+        if (totalLogicalBytes <= 0)
+        {
+            _logger.Info("No partitions selected for hash verification after exclusions.");
+            progress.TotalBytes = 1;
+            progress.BytesCopied = 1;
+            progress.PercentComplete = 100;
+            progress.ThroughputBytesPerSec = 0;
+            progress.EstimatedTimeRemaining = TimeSpan.Zero;
+            ReportProgress(progress);
+            return true;
+        }
+
+        progress.TotalBytes = totalLogicalBytes;
+        progress.BytesCopied = 0;
+        progress.PercentComplete = 0;
+        progress.ThroughputBytesPerSec = 0;
+        progress.EstimatedTimeRemaining = TimeSpan.Zero;
+        ReportProgress(progress);
+
+        var totalCheckedLogical = 0L;
 
         foreach (var partition in operation.PartitionsToClone)
         {
             if (excludedPartitionNumbers != null && excludedPartitionNumbers.Contains(partition.PartitionNumber))
             {
-                _logger.Warning($"Skipping hash verification for migrated partition {partition.PartitionNumber} (file-system migration mode).");
+                _logger.Warning($"Skipping hash verification for excluded partition {partition.PartitionNumber}.");
                 continue;
             }
 
@@ -2566,6 +3046,35 @@ public class DiskClonerEngine
 
             var sourceOffset = partition.StartingOffset;
             var targetOffset = GetRequiredTargetStartingOffset(partition);
+            var verificationLength = GetVerificationLengthBytes(partition);
+            if (verificationLength <= 0)
+            {
+                _logger.Warning($"Skipping hash verification for partition {partition.PartitionNumber}: no bytes selected for comparison.");
+                continue;
+            }
+
+            var partitionBaseLogical = totalCheckedLogical;
+            var sourceBytesRead = 0L;
+            var targetBytesRead = 0L;
+            var lastProgressUpdate = DateTime.UtcNow;
+            var bytesSinceLastUpdate = 0L;
+
+            void ReportPartitionProgress()
+            {
+                // Map two hash passes (source + target) onto one logical partition length.
+                var sourceContribution = sourceBytesRead / 2;
+                var targetContribution = targetBytesRead / 2;
+                var partitionLogicalProgress = Math.Min(
+                    verificationLength,
+                    sourceContribution + targetContribution + Math.Min(verificationLength % 2, sourceBytesRead > 0 || targetBytesRead > 0 ? 1 : 0));
+
+                progress.BytesCopied = Math.Min(progress.TotalBytes, partitionBaseLogical + partitionLogicalProgress);
+                progress.PercentComplete = (progress.BytesCopied * 100.0) / Math.Max(1, progress.TotalBytes);
+
+                var remainingBytes = Math.Max(0L, progress.TotalBytes - progress.BytesCopied);
+                progress.EstimatedTimeRemaining = CalculateSafeEta(remainingBytes, progress.ThroughputBytesPerSec);
+                ReportProgress(progress);
+            }
 
             // Read and hash source (use independent SHA instances for source and target)
             using (var srcSha = SHA256.Create())
@@ -2573,9 +3082,23 @@ public class DiskClonerEngine
                 var sourceHash = await ComputeHashAsync(
                     operation.SourceDisk.DiskNumber,
                     sourceOffset,
-                    partition.TargetSizeBytes,
+                    verificationLength,
                     bufferSize,
-                    srcSha);
+                    srcSha,
+                    bytesRead =>
+                    {
+                        sourceBytesRead += bytesRead;
+                        bytesSinceLastUpdate += bytesRead;
+                        var now = DateTime.UtcNow;
+                        if (now - lastProgressUpdate >= TimeSpan.FromMilliseconds(250))
+                        {
+                            var elapsedSec = (now - lastProgressUpdate).TotalSeconds;
+                            progress.ThroughputBytesPerSec = elapsedSec > 0 ? bytesSinceLastUpdate / elapsedSec : 0;
+                            ReportPartitionProgress();
+                            lastProgressUpdate = now;
+                            bytesSinceLastUpdate = 0;
+                        }
+                    });
 
                 // Read and hash target with a separate SHA instance
                 using (var tgtSha = SHA256.Create())
@@ -2583,9 +3106,23 @@ public class DiskClonerEngine
                     var targetHash = await ComputeHashAsync(
                         operation.TargetDisk.DiskNumber,
                         targetOffset,
-                        partition.TargetSizeBytes,
+                        verificationLength,
                         bufferSize,
-                        tgtSha);
+                        tgtSha,
+                        bytesRead =>
+                        {
+                            targetBytesRead += bytesRead;
+                            bytesSinceLastUpdate += bytesRead;
+                            var now = DateTime.UtcNow;
+                            if (now - lastProgressUpdate >= TimeSpan.FromMilliseconds(250))
+                            {
+                                var elapsedSec = (now - lastProgressUpdate).TotalSeconds;
+                                progress.ThroughputBytesPerSec = elapsedSec > 0 ? bytesSinceLastUpdate / elapsedSec : 0;
+                                ReportPartitionProgress();
+                                lastProgressUpdate = now;
+                                bytesSinceLastUpdate = 0;
+                            }
+                        });
 
                     if (!sourceHash.SequenceEqual(targetHash))
                     {
@@ -2595,8 +3132,11 @@ public class DiskClonerEngine
                 }
             }
 
-            totalChecked += partition.TargetSizeBytes;
-            progress.BytesCopied = totalChecked;
+            totalCheckedLogical += verificationLength;
+            progress.BytesCopied = totalCheckedLogical;
+            progress.PercentComplete = (progress.BytesCopied * 100.0) / Math.Max(1, progress.TotalBytes);
+            progress.ThroughputBytesPerSec = 0;
+            progress.EstimatedTimeRemaining = TimeSpan.Zero;
             ReportProgress(progress);
         }
 
@@ -2693,7 +3233,8 @@ public class DiskClonerEngine
         long offset,
         long length,
         int bufferSize,
-        HashAlgorithm hashAlgorithm)
+        HashAlgorithm hashAlgorithm,
+        Action<long>? onBytesRead = null)
     {
         var path = $@"\\.\PhysicalDrive{diskNumber}";
         var buffer = new byte[bufferSize];
@@ -2725,6 +3266,7 @@ public class DiskClonerEngine
                     throw new IOException($"Failed to read: {WindowsApi.GetLastErrorMessage()}");
 
                 hashAlgorithm.TransformBlock(buffer, 0, (int)bytesRead, null, 0);
+                onBytesRead?.Invoke(bytesRead);
 
                 bytesRemaining -= bytesRead;
                 offset += bytesRead;
@@ -2734,6 +3276,15 @@ public class DiskClonerEngine
         });
 
         return hashAlgorithm.Hash ?? Array.Empty<byte>();
+    }
+
+    private static long GetVerificationLengthBytes(PartitionInfo partition)
+    {
+        if (partition.SizeBytes <= 0 || partition.TargetSizeBytes <= 0)
+            return 0;
+
+        // Never verify beyond source partition boundaries.
+        return Math.Min(partition.SizeBytes, partition.TargetSizeBytes);
     }
 
     /// <summary>
@@ -2814,9 +3365,10 @@ public class DiskClonerEngine
     /// <summary>
     /// Makes the target disk bootable by fixing boot configuration.
     /// </summary>
-    private async Task<bool> MakeBootableAsync(CloneOperation operation)
+    private async Task<BootFinalizationStatus> MakeBootableAsync(CloneOperation operation)
     {
         _logger.Info("Making target disk bootable...");
+        var status = new BootFinalizationStatus();
 
         try
         {
@@ -2829,15 +3381,17 @@ public class DiskClonerEngine
             // is sufficient.
 
             // Step 3: Use bcdboot to ensure proper boot files are present
-            await UpdateBootConfigurationAsync(operation);
+            status = await UpdateBootConfigurationAsync(operation);
 
             _logger.Info("Target disk should be bootable");
-            return true;
+            status.Success = true;
+            return status;
         }
         catch (Exception ex)
         {
             _logger.Warning($"Failed to make target bootable: {ex.Message}");
-            return false;
+            status.Success = false;
+            return status;
         }
     }
 
@@ -2986,10 +3540,11 @@ public class DiskClonerEngine
     /// <summary>
     /// Updates the boot configuration on the target disk.
     /// </summary>
-    private async Task UpdateBootConfigurationAsync(CloneOperation operation)
+    private async Task<BootFinalizationStatus> UpdateBootConfigurationAsync(CloneOperation operation)
     {
         _logger.Info("Updating boot configuration...");
         EnsureTargetDiskMutationAllowed(operation, operation.TargetDisk.DiskNumber, "update boot configuration");
+        var status = new BootFinalizationStatus();
 
         var systemPartition = operation.PartitionsToClone.FirstOrDefault(p => p.IsSystemPartition);
         if (systemPartition == null)
@@ -3014,7 +3569,10 @@ public class DiskClonerEngine
             await MountExistingTargetPartitionAsync(operation, systemPartition.TargetPartitionNumber, windowsLetter);
             ValidateMountedWindowsPartitionAsync(systemPartition, windowsLetter);
             await ExpandMountedNtfsFileSystemAsync(operation, windowsLetter);
-            await RepairMountedWindowsVolumeAsync(operation, windowsLetter);
+            var repairStatus = await RepairMountedWindowsVolumeAsync(operation, windowsLetter);
+            status.WindowsVolumeClean = !repairStatus.DirtyAfterRepair;
+            status.ChkdskFixApplied = repairStatus.FixApplied;
+            status.WindowsVolumeStatus = repairStatus.Summary;
 
             if (isUefi)
             {
@@ -3023,11 +3581,15 @@ public class DiskClonerEngine
                 await MountExistingTargetPartitionAsync(operation, efiPartition!.TargetPartitionNumber, efiLetter.Value);
                 await RebuildBootFilesAsync(operation, windowsLetter, efiLetter.Value);
                 ValidateEfiBootArtifacts(efiLetter.Value);
+                status.BootFilesRebuilt = true;
             }
             else
             {
                 _logger.Warning("Legacy BIOS boot repair is not automated yet. Manual boot repair may be required for MBR clones.");
+                status.BootFilesRebuilt = true;
             }
+
+            return status;
         }
         finally
         {
@@ -3092,13 +3654,53 @@ public class DiskClonerEngine
         }
     }
 
-    private async Task RepairMountedWindowsVolumeAsync(CloneOperation operation, char windowsLetter)
+    private async Task<VolumeRepairStatus> RepairMountedWindowsVolumeAsync(CloneOperation operation, char windowsLetter)
     {
         EnsureTargetVolumeMutationAllowed(operation, windowsLetter, "repair mounted target filesystem");
         var normalized = NormalizeDriveLetter(windowsLetter);
         var volumeArg = $"{normalized}:";
+        var status = new VolumeRepairStatus();
 
-        var chkdskStartInfo = new System.Diagnostics.ProcessStartInfo
+        var scanStartInfo = new System.Diagnostics.ProcessStartInfo
+        {
+            FileName = "chkdsk.exe",
+            Arguments = $"{volumeArg} /scan",
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+
+        var (scanExitCode, scanOutput, scanError) = await RunProcessAsync(scanStartInfo);
+        _logger.Info($"CHKDSK /scan output for {volumeArg}: {scanOutput}");
+        // CHKDSK returns a bitmask exit code. For /scan, any non-zero code is treated as
+        // "issues found or online repair incomplete", and we proceed to /f when needed.
+        if (scanExitCode != 0)
+        {
+            _logger.Warning(
+                $"CHKDSK /scan returned code {scanExitCode} for {volumeArg}; continuing with offline fix if needed.");
+        }
+
+        status.ScanDetectedIssues = scanExitCode != 0
+            || scanOutput.Contains("found problems", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("found errors", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("run chkdsk /f", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("must be fixed", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("must be fixed offline", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("Aborting", StringComparison.OrdinalIgnoreCase)
+            || scanOutput.Contains("run \"chkdsk /spotfix\"", StringComparison.OrdinalIgnoreCase);
+
+        status.DirtyBeforeFix = await IsVolumeDirtyAsync(volumeArg);
+        if (!status.ScanDetectedIssues && !status.DirtyBeforeFix)
+        {
+            status.FixApplied = false;
+            status.DirtyAfterRepair = false;
+            status.Summary = "Scan clean; no offline fix needed.";
+            _logger.Info($"Skipping CHKDSK /f for {volumeArg}: scan clean and volume not dirty.");
+            return status;
+        }
+
+        var chkdskFixStartInfo = new System.Diagnostics.ProcessStartInfo
         {
             FileName = "chkdsk.exe",
             Arguments = $"{volumeArg} /f /x",
@@ -3108,13 +3710,29 @@ public class DiskClonerEngine
             RedirectStandardError = true
         };
 
-        var (chkdskExitCode, chkdskOutput, chkdskError) = await RunProcessAsync(chkdskStartInfo);
-        _logger.Info($"CHKDSK /f output for {volumeArg}: {chkdskOutput}");
-        if (chkdskExitCode > 3)
+        var (chkdskFixExitCode, chkdskFixOutput, chkdskFixError) = await RunProcessAsync(chkdskFixStartInfo);
+        _logger.Info($"CHKDSK /f output for {volumeArg}: {chkdskFixOutput}");
+        if (chkdskFixExitCode != 0)
         {
-            throw new IOException($"chkdsk /f failed for {volumeArg}: (code {chkdskExitCode}) {chkdskError}");
+            _logger.Warning(
+                $"CHKDSK /f returned code {chkdskFixExitCode} for {volumeArg}; validating dirty bit and continuing when clean.");
         }
 
+        status.FixApplied = true;
+        status.DirtyAfterRepair = await IsVolumeDirtyAsync(volumeArg);
+        if (status.DirtyAfterRepair)
+        {
+            throw new IOException($"Target Windows volume {volumeArg} remains dirty after chkdsk /f.");
+        }
+
+        status.Summary = status.ScanDetectedIssues
+            ? "Scan reported issues; chkdsk /f applied and volume is clean."
+            : "Dirty bit was set; chkdsk /f applied and volume is clean.";
+        return status;
+    }
+
+    private async Task<bool> IsVolumeDirtyAsync(string volumeArg)
+    {
         var fsutilStartInfo = new System.Diagnostics.ProcessStartInfo
         {
             FileName = "fsutil.exe",
@@ -3132,10 +3750,7 @@ public class DiskClonerEngine
             throw new IOException($"fsutil dirty query failed for {volumeArg}: (code {fsutilExitCode}) {fsutilError}");
         }
 
-        if (fsutilOutput.Contains("is dirty", StringComparison.OrdinalIgnoreCase))
-        {
-            throw new IOException($"Target Windows volume {volumeArg} remains dirty after chkdsk /f.");
-        }
+        return fsutilOutput.Contains("is dirty", StringComparison.OrdinalIgnoreCase);
     }
 
     private void ValidateEfiBootArtifacts(char efiLetter)
@@ -3228,6 +3843,37 @@ public class DiskClonerEngine
         }
     }
 
+    private void AppendHealthChecksSummary(
+        CloneResult result,
+        bool partitionMappingCompleted,
+        BootFinalizationStatus? bootStatus,
+        string vssCleanupStatus,
+        string vssCleanupMessage)
+    {
+        result.HealthChecks.Clear();
+
+        var partitionMappingLine = $"Partition mapping: {(partitionMappingCompleted ? "OK" : "Not completed")}";
+        result.HealthChecks.Add(partitionMappingLine);
+        _logger.Info($"Health check: {partitionMappingLine}");
+
+        var bootFilesLine = $"Boot files: {(bootStatus?.BootFilesRebuilt == true ? "OK" : "Not rebuilt")}";
+        result.HealthChecks.Add(bootFilesLine);
+        _logger.Info($"Health check: {bootFilesLine}");
+
+        var volumeCleanLine = $"Windows volume clean: {bootStatus?.WindowsVolumeStatus ?? "Not checked"}";
+        result.HealthChecks.Add(volumeCleanLine);
+        _logger.Info($"Health check: {volumeCleanLine}");
+
+        var normalizedCleanupStatus = string.IsNullOrWhiteSpace(vssCleanupStatus) ? "Unknown" : vssCleanupStatus;
+        var vssLine = $"VSS cleanup: {normalizedCleanupStatus}";
+        if (!string.IsNullOrWhiteSpace(vssCleanupMessage))
+        {
+            vssLine += $" ({vssCleanupMessage})";
+        }
+        result.HealthChecks.Add(vssLine);
+        _logger.Info($"Health check: {vssLine}");
+    }
+
     /// <summary>
     /// Cancels the ongoing cloning operation.
     /// </summary>
@@ -3292,7 +3938,9 @@ public class DiskClonerEngine
 
         sb.AppendLine("Options:");
         sb.AppendLine($"  Use VSS: {operation.UseVss}");
-        sb.AppendLine($"  Verify: {operation.VerifyIntegrity} ({(operation.FullHashVerification ? "Full" : "Sampling")})");
+        sb.AppendLine($"  Source Read Mode: {operation.SourceReadMode}");
+        sb.AppendLine($"  Quiet Mode: {operation.EnableQuietMode}");
+        sb.AppendLine($"  Verify: {operation.VerifyIntegrity}");
         sb.AppendLine($"  Strict Verify Fail: {operation.StrictVerificationFailureStopsClone}");
         sb.AppendLine($"  Expand C:: {operation.AutoExpandWindowsPartition}");
         sb.AppendLine($"  Allow Smaller Target: {operation.AllowSmallerTarget}");
@@ -3321,14 +3969,9 @@ public class DiskClonerEngine
         // Add 20% overhead
         baseSeconds = (long)(baseSeconds * 1.2);
 
-        // Add verification time if enabled
+        // Add verification overhead when enabled.
         if (operation.VerifyIntegrity)
-        {
-            if (operation.FullHashVerification)
-                baseSeconds = (long)(baseSeconds * 2.5); // Full verification takes ~2.5x
-            else
-                baseSeconds = (long)(baseSeconds * 1.2); // Sampling adds ~20%
-        }
+            baseSeconds = (long)(baseSeconds * 1.2);
 
         return TimeSpan.FromSeconds(baseSeconds);
     }

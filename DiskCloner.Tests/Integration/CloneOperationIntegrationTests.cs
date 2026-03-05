@@ -243,7 +243,6 @@ public class CloneOperationIntegrationTests
             UseVss = true,
             IoBufferSize = 64 * 1024 * 1024,
             VerifyIntegrity = true,
-            FullHashVerification = false,
             AutoExpandWindowsPartition = true,
             AllowSmallerTarget = false,
             StrictVerificationFailureStopsClone = true,
@@ -258,7 +257,6 @@ public class CloneOperationIntegrationTests
         Assert.True(operation.UseVss);
         Assert.Equal(64 * 1024 * 1024, operation.IoBufferSize);
         Assert.True(operation.VerifyIntegrity);
-        Assert.False(operation.FullHashVerification);
         Assert.True(operation.AutoExpandWindowsPartition);
         Assert.False(operation.AllowSmallerTarget);
         Assert.True(operation.StrictVerificationFailureStopsClone);

@@ -26,6 +26,11 @@ public class CloneOperation
     public bool UseVss { get; set; } = true;
 
     /// <summary>
+    /// Source read mode used during partition data copy.
+    /// </summary>
+    public SourceReadMode SourceReadMode { get; set; } = SourceReadMode.LivePreferred;
+
+    /// <summary>
     /// Buffer size for disk I/O operations in bytes.
     /// </summary>
     public int IoBufferSize { get; set; } = 64 * 1024 * 1024; // 64MB default
@@ -34,11 +39,6 @@ public class CloneOperation
     /// Whether to verify copied data integrity using hashes.
     /// </summary>
     public bool VerifyIntegrity { get; set; } = true;
-
-    /// <summary>
-    /// Whether to perform full hash verification (slow) or sampling (fast).
-    /// </summary>
-    public bool FullHashVerification { get; set; } = true;
 
     /// <summary>
     /// Whether to automatically expand the Windows partition after cloning.
@@ -56,6 +56,12 @@ public class CloneOperation
     /// Only applies to NTFS partitions; other partition types always use raw copy.
     /// </summary>
     public bool SmartCopy { get; set; } = false;
+
+    /// <summary>
+    /// Whether to pause selected background writers on the source system
+    /// before snapshot/copy to improve live-clone consistency.
+    /// </summary>
+    public bool EnableQuietMode { get; set; } = true;
 
     /// <summary>
     /// Whether verification mismatch should fail the clone operation.
@@ -76,6 +82,12 @@ public class CloneOperation
     /// Operation ID for tracking.
     /// </summary>
     public Guid OperationId { get; set; } = Guid.NewGuid();
+}
+
+public enum SourceReadMode
+{
+    LivePreferred = 0,
+    SnapshotRawStrict = 1
 }
 
 /// <summary>
@@ -299,4 +311,9 @@ public class CloneResult
     /// Non-fatal warnings encountered during the operation.
     /// </summary>
     public List<string> Warnings { get; set; } = new();
+
+    /// <summary>
+    /// End-of-run health checks summary.
+    /// </summary>
+    public List<string> HealthChecks { get; set; } = new();
 }

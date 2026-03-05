@@ -193,7 +193,7 @@ public class FileLoggerTests : IDisposable
 
         // Assert
         var logContent = ReadLogContent();
-        Assert.Contains(DateTime.Now.ToString("yyyy-MM-dd"), logContent);
+        Assert.Contains(DateTime.UtcNow.ToString("yyyy-MM-dd"), logContent);
     }
 
     [Fact]
