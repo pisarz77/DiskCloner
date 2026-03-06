@@ -1,3 +1,5 @@
+using DiskCloner.Core.Utilities;
+
 namespace DiskCloner.Core.Models;
 
 /// <summary>
@@ -158,32 +160,17 @@ public class CloneProgress
     /// <summary>
     /// Formatted bytes copied.
     /// </summary>
-    public string BytesCopiedDisplay => FormatBytes(BytesCopied);
+    public string BytesCopiedDisplay => ByteFormatter.Format(BytesCopied);
 
     /// <summary>
     /// Formatted total bytes.
     /// </summary>
-    public string TotalBytesDisplay => FormatBytes(TotalBytes);
+    public string TotalBytesDisplay => ByteFormatter.Format(TotalBytes);
 
     /// <summary>
     /// Formatted throughput.
     /// </summary>
-    public string ThroughputDisplay => FormatBytes((long)ThroughputBytesPerSec) + "/s";
-
-    private static string FormatBytes(long bytes)
-    {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
-        int order = 0;
-        double size = bytes;
-
-        while (size >= 1024 && order < sizes.Length - 1)
-        {
-            order++;
-            size /= 1024;
-        }
-
-        return $"{size:0.##} {sizes[order]}";
-    }
+    public string ThroughputDisplay => ByteFormatter.Format((long)ThroughputBytesPerSec) + "/s";
 }
 
 /// <summary>

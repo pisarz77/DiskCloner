@@ -1,3 +1,4 @@
+using DiskCloner.Core.Utilities;
 using System.Text;
 
 namespace DiskCloner.Core.Models;
@@ -80,7 +81,7 @@ public class DiskInfo
     /// <summary>
     /// Formatted size string for display.
     /// </summary>
-    public string SizeDisplay => FormatBytes(SizeBytes);
+    public string SizeDisplay => ByteFormatter.Format(SizeBytes);
 
     public override string ToString()
     {
@@ -95,18 +96,4 @@ public class DiskInfo
         return sb.ToString();
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB", "PB" };
-        int order = 0;
-        double size = bytes;
-
-        while (size >= 1024 && order < sizes.Length - 1)
-        {
-            order++;
-            size /= 1024;
-        }
-
-        return $"{size:0.##} {sizes[order]}";
-    }
 }

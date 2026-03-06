@@ -1,6 +1,7 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Native;
+using DiskCloner.Core.Utilities;
 using System.Globalization;
 using System.Management;
 using System.Runtime.InteropServices;
@@ -46,37 +47,6 @@ public class DiskClonerEngine
         FileSystemMigration
     }
 
-    private sealed class BootFinalizationStatus
-    {
-        public bool Success { get; set; }
-        public bool BootFilesRebuilt { get; set; }
-        public bool WindowsVolumeClean { get; set; }
-        public bool ChkdskFixApplied { get; set; }
-        public string WindowsVolumeStatus { get; set; } = "Not checked";
-    }
-
-    private sealed class VolumeRepairStatus
-    {
-        public bool ScanDetectedIssues { get; set; }
-        public bool DirtyBeforeFix { get; set; }
-        public bool FixApplied { get; set; }
-        public bool DirtyAfterRepair { get; set; }
-        public string Summary { get; set; } = string.Empty;
-    }
-
-    private sealed class SourceReadDescriptor
-    {
-        public string SourcePath { get; set; } = string.Empty;
-        public long BaseOffset { get; set; }
-        public bool IsSnapshotBacked { get; set; }
-    }
-
-    private sealed class QuietModeState
-    {
-        public List<string> StoppedServices { get; } = new();
-        public bool OneDriveStopped { get; set; }
-        public string? OneDriveExecutablePath { get; set; }
-    }
 
     public event Action<CloneProgress>? ProgressUpdate;
 
@@ -570,7 +540,7 @@ public class DiskClonerEngine
         if (targetIsSmallerThanRequired && !operation.AllowSmallerTarget)
         {
             throw new InvalidOperationException(
-                $"Target disk is too small. Required: {FormatBytes(totalSpaceRequired)}. " +
+                $"Target disk is too small. Required: {ByteFormatter.Format(totalSpaceRequired)}. " +
                 "Enable 'Allow smaller target' to auto-shrink.");
         }
 
@@ -601,11 +571,11 @@ public class DiskClonerEngine
             if (maxSystemBytes < (5L * 1024 * 1024 * 1024)) // Min 5GB
             {
                 throw new InvalidOperationException(
-                    $"Target disk is too small even with shrinking. Only {FormatBytes(maxSystemBytes)} available for Windows.");
+                    $"Target disk is too small even with shrinking. Only {ByteFormatter.Format(maxSystemBytes)} available for Windows.");
             }
 
             systemPartition.TargetSizeBytes = maxSystemBytes;
-            _logger.Info($"Layout planning: shrinking Windows partition to {FormatBytes(maxSystemBytes)} to fit target.");
+            _logger.Info($"Layout planning: shrinking Windows partition to {ByteFormatter.Format(maxSystemBytes)} to fit target.");
             return;
         }
 
@@ -617,7 +587,7 @@ public class DiskClonerEngine
             {
                 systemPartition.TargetSizeBytes = maxSystemBytes;
                 _logger.Info(
-                    $"Layout planning: pre-expanding Windows partition to {FormatBytes(maxSystemBytes)} " +
+                    $"Layout planning: pre-expanding Windows partition to {ByteFormatter.Format(maxSystemBytes)} " +
                     "while reserving space for remaining partitions.");
             }
         }
@@ -645,19 +615,6 @@ public class DiskClonerEngine
             return 0;
 
         return systemMb * OneMiB;
-    }
-
-    private string FormatBytes(long bytes)
-    {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
-        int order = 0;
-        double size = bytes;
-        while (size >= 1024 && order < sizes.Length - 1)
-        {
-            order++;
-            size /= 1024;
-        }
-        return $"{size:0.##} {sizes[order]}";
     }
 
     /// <summary>
@@ -1286,7 +1243,7 @@ public class DiskClonerEngine
     {
         var sourceRead = await ResolveSourceReadDescriptorAsync(operation, partition);
         _logger.Info(
-            $"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) to target ({FormatBytes(partition.TargetSizeBytes)}). " +
+            $"Copying partition {partition.PartitionNumber} ({partition.SizeDisplay}) to target ({ByteFormatter.Format(partition.TargetSizeBytes)}). " +
             $"Source mode: {(sourceRead.IsSnapshotBacked ? "SnapshotRawStrict" : "LiveRaw")}.");
 
         var sourcePath = sourceRead.SourcePath;
@@ -3921,8 +3878,8 @@ public class DiskClonerEngine
         {
             var role = partition.GetTypeName();
             var label = string.IsNullOrEmpty(partition.VolumeLabel) ? "" : $" [{partition.VolumeLabel}]";
-            var sourceSize = FormatBytes(partition.SizeBytes);
-            var targetSize = FormatBytes(partition.TargetSizeBytes);
+            var sourceSize = ByteFormatter.Format(partition.SizeBytes);
+            var targetSize = ByteFormatter.Format(partition.TargetSizeBytes);
             var resizeInfo = partition.TargetSizeBytes < partition.SizeBytes
                 ? " [SHRUNK]"
                 : partition.TargetSizeBytes > partition.SizeBytes
@@ -3933,7 +3890,7 @@ public class DiskClonerEngine
         sb.AppendLine();
         var plannedFootprint = OneMiB;
         plannedFootprint += operation.PartitionsToClone.Sum(p => p.TargetSizeBytes + OneMiB);
-        sb.AppendLine($"Planned Target Footprint: {FormatBytes(plannedFootprint)} / {operation.TargetDisk.SizeDisplay}");
+        sb.AppendLine($"Planned Target Footprint: {ByteFormatter.Format(plannedFootprint)} / {operation.TargetDisk.SizeDisplay}");
         sb.AppendLine();
 
         sb.AppendLine("Options:");

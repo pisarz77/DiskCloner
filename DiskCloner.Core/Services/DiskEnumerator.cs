@@ -201,6 +201,9 @@ public class DiskEnumerator
             interfaceType.Contains("ATA", StringComparison.OrdinalIgnoreCase))
             return "IDE/ATA";
 
+        if (interfaceType.Contains("RAID", StringComparison.OrdinalIgnoreCase))
+            return "RAID";
+
         return string.IsNullOrEmpty(interfaceType) ? "UNKNOWN" : interfaceType.ToUpperInvariant();
     }
 
@@ -595,33 +598,6 @@ public class DiskEnumerator
         return false;
     }
 
-    /// <summary>
-    /// Determines the bus type of the disk.
-    /// </summary>
-    private string DetermineBusType(ManagementObject diskObj)
-    {
-        var interfaceType = diskObj["InterfaceType"]?.ToString() ?? "";
-        var mediaType = diskObj["MediaType"]?.ToString() ?? "";
-
-        if (interfaceType.Contains("USB", StringComparison.OrdinalIgnoreCase) ||
-            mediaType.Contains("USB", StringComparison.OrdinalIgnoreCase))
-            return "USB";
-
-        if (interfaceType.Contains("SCSI", StringComparison.OrdinalIgnoreCase))
-            return "SCSI/SATA";
-
-        if (interfaceType.Contains("NVMe", StringComparison.OrdinalIgnoreCase))
-            return "NVMe";
-
-        if (interfaceType.Contains("IDE", StringComparison.OrdinalIgnoreCase) ||
-            interfaceType.Contains("ATA", StringComparison.OrdinalIgnoreCase))
-            return "IDE/ATA";
-
-        if (interfaceType.Contains("RAID", StringComparison.OrdinalIgnoreCase))
-            return "RAID";
-
-        return interfaceType.ToUpperInvariant();
-    }
 
     /// <summary>
     /// Determines the type/role of a partition (EFI, System, MSR, Recovery, etc.).

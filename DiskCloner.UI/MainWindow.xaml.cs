@@ -1,6 +1,7 @@
 using DiskCloner.Core.Logging;
 using DiskCloner.Core.Models;
 using DiskCloner.Core.Services;
+using DiskCloner.Core.Utilities;
 using System.Diagnostics;
 using System.IO;
 using System.Windows;
@@ -460,11 +461,11 @@ public partial class MainWindow : Window
 
         var sb = new System.Text.StringBuilder();
         sb.AppendLine($"Duration: {result.Duration:hh\\:mm\\:ss}");
-        sb.AppendLine($"Bytes Copied: {FormatBytes(result.BytesCopied)}");
+        sb.AppendLine($"Bytes Copied: {ByteFormatter.Format(result.BytesCopied)}");
 
         if (result.Duration.TotalSeconds > 0)
         {
-            sb.AppendLine($"Average Speed: {FormatBytes((long)result.AverageThroughputBytesPerSec)}/s");
+            sb.AppendLine($"Average Speed: {ByteFormatter.Format((long)result.AverageThroughputBytesPerSec)}/s");
         }
 
         sb.AppendLine($"Integrity Verified: {(result.IntegrityVerified ? "Yes" : "No")}");
@@ -629,7 +630,7 @@ public partial class MainWindow : Window
             {
                 MessageBox.Show(
                     $"The target disk ({targetDisk.SizeDisplay}) is too small for the selected partitions.\n" +
-                    $"Required layout size: {FormatBytes(requiredBytes)}.\n\n" +
+                    $"Required layout size: {ByteFormatter.Format(requiredBytes)}.\n\n" +
                     "Either shrink selected source partitions more, choose a larger target, " +
                     "or enable 'Allow smaller target disk'.",
                     "Target Too Small",
@@ -770,20 +771,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string FormatBytes(long bytes)
-    {
-        string[] sizes = { "B", "KB", "MB", "GB", "TB" };
-        int order = 0;
-        double size = bytes;
 
-        while (size >= 1024 && order < sizes.Length - 1)
-        {
-            order++;
-            size /= 1024;
-        }
-
-        return $"{size:0.##} {sizes[order]}";
-    }
 
     private static string FormatTimeSpan(TimeSpan ts)
     {

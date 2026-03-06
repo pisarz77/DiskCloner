@@ -1,0 +1,124 @@
+# DiskCloner — Best Practices Analysis
+
+> **Branch under review:** `vscode/fixing-after-code-review` (8 commits ahead of `main`)
+> **Previous review:** against `main` — original analysis on 2026-03-01
+> **Updated:** 2026-03-02
+
+---
+
+## Scorecard — Original 16 Findings
+
+| # | Finding | Status |
+|---|---|---|
+| 1 | No test project | ✅ Fixed |
+| 2 | `bin/obj` committed to Git | ✅ Fixed |
+| 3 | [DiskClonerEngine](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/DiskClonerEngine.cs#13-1031) god class | ⚠️ Worse (1,031 → 1,960 lines) |
+| 4 | No MVVM in WPF UI | ❌ Still open |
+| 5 | No dependency injection | ❌ Still open |
+| 6 | No interfaces for services | ❌ Still open |
+| 7 | `event Action<T>` instead of `IProgress<T>` | ❌ Still open |
+| 8 | [FormatBytes](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/CloneOperation.cs#151-165) duplicated 4× | ❌ Still open (now 5× — also in engine) |
+| 9 | Hardcoded 512-byte sector size | ❌ Still open |
+| 10 | `IDisposable` pattern in [VssSnapshotService](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/VssSnapshotService.cs#25-30) | ❌ Still open |
+| 11 | Custom [ILogger](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Logging/ILogger.cs#6-43) vs `Microsoft.Extensions.Logging` | ❌ Still open |
+| 12 | SHA-256 reuse bug | ✅ Fixed |
+| 13 | No CI/CD pipeline | ❌ Still open |
+| 14 | No `.editorconfig` / analyzers | ❌ Still open |
+| 15 | Invalid solution GUID `9C5B2E6G` | ❌ Still open |
+| 16 | No `Directory.Build.props` | ❌ Still open |
+
+---
+
+## What Was Fixed ✅
+
+### 1. Test Project Added
+A `DiskCloner.UnitTests` project was created with xUnit and 3 tests covering hashing and sector-aligned padding via [TestHelpers.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Utilities/TestHelpers.cs). This is a solid start.
+
+### 2. `bin/obj` Removed from Git
+Confirmed 0 build artifacts are tracked — the [.gitignore](file:///Users/pisarz/Documents/projekty/test-diskcloning/.gitignore) is now effective.
+
+### 3. SHA-256 Reuse Bug Fixed
+Source and target now use **independent** `SHA256` instances (`srcSha` / `tgtSha`) in both full and sample verification paths. Correct.
+
+### 4. Sector-Aligned Write Padding
+New `TestHelpers.GetSectorPaddedBuffer()` utility ensures writes are sector-aligned with proper zero-padding. Unit tested.
+
+### 5. Improved Diskpart Scripting
+- Recovery partitions now get correct GPT type ID and attributes
+- Disk is taken offline before raw writes (critical for Windows)
+- [OnlineTargetDiskAsync()](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/DiskClonerEngine.cs#1714-1768) brings disk back after copy
+- Better error handling for access-denied during pre-clear
+
+### 6. Partition Offset Mapping
+New [ApplyTargetPartitionOffsets()](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/DiskClonerEngine.cs#584-638) maps source partition offsets to actual target offsets from diskpart output, preventing mis-aligned writes. Safety checks abort on mismatch.
+
+---
+
+## New Issues Found on This Branch 🆕
+
+### 17. `DiskCloner.UnitTests` Not in Solution File
+
+The [.sln](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.sln) has `DiskCloner.Tests` but **not** `DiskCloner.UnitTests`. Running `dotnet test DiskCloner.sln` will miss the new unit tests.
+
+```
+# In DiskCloner.sln — present:
+Project("...") = "DiskCloner.Tests" ...
+# Missing:
+# Project("...") = "DiskCloner.UnitTests" ...
+```
+
+### 18. [TestHelpers](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Utilities/TestHelpers.cs#11-42) Lives in Production Assembly
+
+[TestHelpers.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Utilities/TestHelpers.cs) is in `DiskCloner.Core` — the production library. Test-only utilities should live in the test project or use `[InternalsVisibleTo]` if they need access to internals.
+
+### 19. Loose [wmi_test.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/wmi_test.cs) in Project Root
+
+A stray [wmi_test.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/wmi_test.cs) file sits in the repo root — not part of any project. Should be deleted or moved into the test project.
+
+---
+
+## Remaining Open Items (by Priority)
+
+### 🔴 Critical
+
+| # | Item | Notes | Effort |
+|---|---|---|---|
+| 3 | Break up [DiskClonerEngine](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/DiskClonerEngine.cs#13-1031) | Now **1,960 lines** — grew 90% while adding features. Extract `DiskpartService`, `PartitionCopier`, `IntegrityVerifier`, `PartitionMapper` | 1-2 days |
+| 17 | Add `DiskCloner.UnitTests` to [.sln](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.sln) | Tests won't run from solution-level commands | 5 min |
+
+### 🟡 Important
+
+| # | Item | Notes | Effort |
+|---|---|---|---|
+| 8 | Extract shared [FormatBytes](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/CloneOperation.cs#151-165) | Now duplicated **5 times** (3 models + engine + UI) | 15 min |
+| 18 | Move [TestHelpers](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Utilities/TestHelpers.cs#11-42) to test project | Avoids shipping test utilities in production | 15 min |
+| 9 | Use actual sector size instead of hardcoded 512 | `PartitionInfo.StartingSector` and `.Sectors` use `/ 512` | 30 min |
+| 6 | Add interfaces for core services | Enables proper DI and mocking | 2 hrs |
+| 5 | Add DI container in [App.xaml.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.UI/App.xaml.cs) | Unlocks testability, lifecycle management | 2 hrs |
+| 10 | Fix `IDisposable` pattern in VSS service | No [Dispose(bool)](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Services/VssSnapshotService.cs#386-403), no `GC.SuppressFinalize` | 30 min |
+
+### 🟢 Nice-to-Have
+
+| # | Item | Notes | Effort |
+|---|---|---|---|
+| 4 | MVVM + ViewModels | Big refactor, lower priority for a utility tool | 1-2 days |
+| 7 | Use `IProgress<T>` | Eliminates manual `Dispatcher.Invoke` | 1 hr |
+| 11 | Replace custom [ILogger](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Logging/ILogger.cs#6-43) | Shadows `Microsoft.Extensions.Logging.ILogger` | 2 hrs |
+| 13 | Add CI pipeline | At least build + `dotnet test` | 1 hr |
+| 14 | Add `.editorconfig` | Consistent formatting | 30 min |
+| 15 | Fix invalid GUID in [.sln](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.sln) | `9C5B2E6G` has non-hex chars | 5 min |
+| 16 | Add `Directory.Build.props` | Reduce duplication across [.csproj](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.UI/DiskCloner.UI.csproj) files | 15 min |
+| 19 | Clean up [wmi_test.cs](file:///Users/pisarz/Documents/projekty/test-diskcloning/wmi_test.cs) | Delete or move to test project | 5 min |
+
+---
+
+## What's Still Good ✅
+
+- Comprehensive XML documentation on all public APIs
+- Multiple safety confirmations in the UI
+- Clean domain model ([DiskInfo](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/DiskInfo.cs#8-113), [PartitionInfo](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/PartitionInfo.cs#8-188), [CloneOperation](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/CloneOperation.cs#6-70), [CloneResult](file:///Users/pisarz/Documents/projekty/test-diskcloning/DiskCloner.Core/Models/CloneOperation.cs#231-288))
+- `SafeFileHandle` usage throughout native interop
+- Detailed logging with timestamps
+- Cancellation support via `CancellationTokenSource`
+- New partition mapping adds significant correctness improvement
+- Offline/online disk lifecycle is now properly handled
