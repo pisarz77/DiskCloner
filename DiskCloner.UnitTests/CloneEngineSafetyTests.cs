@@ -71,10 +71,8 @@ public class CloneEngineSafetyTests
         var validator = new CloneValidator(logger, new DiskEnumerator(logger), new VssSnapshotService(logger));
         var operation = CreateOperationForMapping();
 
-        var ex = Assert.Throws<TargetInvocationException>(() =>
-            InvokePrivate(validator, "EnsureTargetDiskMutationAllowed", new object[] { operation, 0, "test-op" }));
-
-        Assert.IsType<InvalidOperationException>(ex.InnerException);
+        Assert.Throws<InvalidOperationException>(() =>
+            validator.EnsureTargetDiskMutationAllowed(operation, 0, "test-op"));
     }
 
     [Fact]
