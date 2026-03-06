@@ -12,7 +12,12 @@ public interface ICloneValidator
     /// Validates the clone operation configuration ends calls CalculateTargetLayout.
     /// Throws <see cref="InvalidOperationException"/> on any validation failure.
     /// </summary>
-    Task ValidateAsync(CloneOperation operation, CloneProgress progress);
+    Task ValidateAsync(CloneOperation operation, CloneProgress progress, Action<CloneProgress> reportProgress);
+
+    /// <summary>
+    /// Calculates how partitions will fit on the target disk.
+    /// </summary>
+    void CalculateTargetLayout(CloneOperation operation);
 
     /// <summary>
     /// Asserts that <paramref name="diskNumber"/> is the target disk (not source).

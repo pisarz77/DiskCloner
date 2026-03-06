@@ -11,7 +11,7 @@ public class CloneEngineSafetyTests
     [Fact]
     public void ApplyTargetPartitionOffsets_AssignsTargetPartitionNumbers()
     {
-        var engine = CreateEngine();
+        var service = new DiskpartService(new NoopLogger());
         var operation = CreateOperationForMapping();
 
         var targetPartitions = new List<(int PartitionNumber, string TypeName, long SizeBytes, long StartingOffsetBytes)>
@@ -24,7 +24,7 @@ public class CloneEngineSafetyTests
         };
 
         InvokePrivate(
-            engine,
+            service,
             "ApplyTargetPartitionOffsets",
             new object[] { operation, targetPartitions });
 
@@ -41,7 +41,7 @@ public class CloneEngineSafetyTests
     [Fact]
     public void ApplyTargetPartitionOffsets_AllowsEqualRoundedOffsets_FromDiskpartText()
     {
-        var engine = CreateEngine();
+        var service = new DiskpartService(new NoopLogger());
         var operation = CreateOperationForMapping();
 
         // DiskPart text output may round both recovery offsets to the same GB value.
@@ -55,7 +55,7 @@ public class CloneEngineSafetyTests
         };
 
         InvokePrivate(
-            engine,
+            service,
             "ApplyTargetPartitionOffsets",
             new object[] { operation, targetPartitions });
 
@@ -67,11 +67,12 @@ public class CloneEngineSafetyTests
     [Fact]
     public void EnsureTargetDiskMutationAllowed_RejectsSourceDisk()
     {
-        var engine = CreateEngine();
+        var logger = new NoopLogger();
+        var validator = new CloneValidator(logger, new DiskEnumerator(logger), new VssSnapshotService(logger));
         var operation = CreateOperationForMapping();
 
         var ex = Assert.Throws<TargetInvocationException>(() =>
-            InvokePrivate(engine, "EnsureTargetDiskMutationAllowed", new object[] { operation, 0, "test-op" }));
+            InvokePrivate(validator, "EnsureTargetDiskMutationAllowed", new object[] { operation, 0, "test-op" }));
 
         Assert.IsType<InvalidOperationException>(ex.InnerException);
     }
@@ -79,7 +80,7 @@ public class CloneEngineSafetyTests
     [Fact]
     public void GetCopyStrategy_UsesFileSystemMigrationForShrunkNtfsSystem()
     {
-        var engine = CreateEngine();
+        var copier = new PartitionCopier(new NoopLogger(), new VssSnapshotService(new NoopLogger()), null, default);
         var operation = CreateOperationForMapping();
         operation.AllowSmallerTarget = true;
 
@@ -89,14 +90,27 @@ public class CloneEngineSafetyTests
         system.TargetSizeBytes = 500;
         system.DriveLetter = 'C';
 
-        var strategy = InvokePrivate(engine, "GetCopyStrategy", new object[] { operation, system });
-        Assert.Equal("FileSystemMigration", strategy?.ToString());
+        var strategy = copier.GetCopyStrategy(operation, system);
+        Assert.Equal("FileSystemMigration", strategy.ToString());
     }
 
     [Fact]
     public void GetOperationSummary_ShowsSourceToTargetSizes_WithExpandedSystemPartition()
     {
-        var engine = CreateEngine();
+        var logger = new NoopLogger();
+        var vssService = new VssSnapshotService(logger);
+        var diskEnumerator = new DiskEnumerator(logger);
+        var cts = new CancellationTokenSource();
+        var validator = new CloneValidator(logger, diskEnumerator, vssService);
+        
+        var orchestrator = new CloneOrchestrator(
+            logger, validator, new DiskpartService(logger, cts.Token), 
+            new PartitionCopier(logger, vssService, null, cts.Token),
+            new FileSystemMigrator(logger, vssService, validator, null, cts.Token),
+            new SystemQuietModeService(logger, null),
+            new IntegrityVerifier(logger, PartitionCopier.GetRawCopyLengthBytes, PartitionCopier.CalculateSafeEta, null, cts.Token),
+            new TargetDiskLifecycleManager(logger, validator),
+            diskEnumerator, vssService, cts);
         var operation = new CloneOperation
         {
             SourceDisk = new DiskInfo
@@ -122,7 +136,7 @@ public class CloneEngineSafetyTests
             }
         };
 
-        var summary = engine.GetOperationSummary(operation);
+        var summary = orchestrator.GetOperationSummary(operation);
         var systemPartition = operation.PartitionsToClone.Single(p => p.IsSystemPartition);
 
         Assert.True(systemPartition.TargetSizeBytes > systemPartition.SizeBytes);
@@ -155,11 +169,7 @@ public class CloneEngineSafetyTests
         };
     }
 
-    private static DiskClonerEngine CreateEngine()
-    {
-        var logger = new NoopLogger();
-        return new DiskClonerEngine(logger, new DiskEnumerator(logger), new VssSnapshotService(logger));
-    }
+
 
     private sealed class NoopLogger : ILogger
     {

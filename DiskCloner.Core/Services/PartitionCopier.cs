@@ -575,7 +575,7 @@ public class PartitionCopier : IPartitionCopier
         };
     }
 
-    private long GetEstimatedMigrationBytes(PartitionInfo partition)
+    public static long GetEstimatedMigrationBytes(PartitionInfo partition)
     {
         if (!partition.DriveLetter.HasValue)
             return partition.TargetSizeBytes;

@@ -17,7 +17,7 @@ public partial class MainWindow : Window
 {
     private readonly DiskEnumerator _diskEnumerator;
     private readonly VssSnapshotService _vssService;
-    private DiskClonerEngine? _clonerEngine;
+    private CloneOrchestrator? _clonerEngine;
     private ILogger? _logger;
     private List<DiskInfo> _availableDisks = new();
     private List<PartitionInfo> _allPartitions = new();
@@ -238,7 +238,30 @@ public partial class MainWindow : Window
         try
         {
             var operation = BuildCloneOperation(sourceDisk!, targetDisk!);
-            _clonerEngine = new DiskClonerEngine(_logger!, _diskEnumerator, _vssService);
+
+            var cts = new CancellationTokenSource();
+            var validator = new CloneValidator(_logger!, _diskEnumerator, _vssService);
+            var diskpartService = new DiskpartService(_logger!, cts.Token);
+            var quietMode = new SystemQuietModeService(_logger!, OnProgressUpdate);
+            var verifier = new IntegrityVerifier(_logger!, PartitionCopier.GetRawCopyLengthBytes, PartitionCopier.CalculateSafeEta, OnProgressUpdate, cts.Token);
+            var lifecycle = new TargetDiskLifecycleManager(_logger!, validator);
+            var copier = new PartitionCopier(_logger!, _vssService, OnProgressUpdate, cts.Token);
+            var migrator = new FileSystemMigrator(_logger!, _vssService, validator, OnProgressUpdate, cts.Token);
+
+            _clonerEngine = new CloneOrchestrator(
+                _logger!,
+                validator,
+                diskpartService,
+                copier,
+                migrator,
+                quietMode,
+                verifier,
+                lifecycle,
+                _diskEnumerator,
+                _vssService,
+                cts
+            );
+
             var summary = _clonerEngine.GetOperationSummary(operation);
             PreviewTextBlock.Text = summary;
 
@@ -297,7 +320,29 @@ public partial class MainWindow : Window
     {
         _isCloning = true;
         _currentOperation = BuildCloneOperation(sourceDisk, targetDisk);
-        _clonerEngine = new DiskClonerEngine(_logger!, _diskEnumerator, _vssService);
+
+        var cts = new CancellationTokenSource();
+        var validator = new CloneValidator(_logger!, _diskEnumerator, _vssService);
+        var diskpartService = new DiskpartService(_logger!, cts.Token);
+        var quietMode = new SystemQuietModeService(_logger!, OnProgressUpdate);
+        var verifier = new IntegrityVerifier(_logger!, PartitionCopier.GetRawCopyLengthBytes, PartitionCopier.CalculateSafeEta, OnProgressUpdate, cts.Token);
+        var lifecycle = new TargetDiskLifecycleManager(_logger!, validator);
+        var copier = new PartitionCopier(_logger!, _vssService, OnProgressUpdate, cts.Token);
+        var migrator = new FileSystemMigrator(_logger!, _vssService, validator, OnProgressUpdate, cts.Token);
+
+        _clonerEngine = new CloneOrchestrator(
+            _logger!,
+            validator,
+            diskpartService,
+            copier,
+            migrator,
+            quietMode,
+            verifier,
+            lifecycle,
+            _diskEnumerator,
+            _vssService,
+            cts
+        );
 
         // Subscribe to progress updates
         _clonerEngine.ProgressUpdate += OnProgressUpdate;

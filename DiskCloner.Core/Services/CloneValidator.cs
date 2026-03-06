@@ -13,27 +13,18 @@ public class CloneValidator : ICloneValidator
     private readonly ILogger _logger;
     private readonly DiskEnumerator _diskEnumerator;
     private readonly VssSnapshotService _vssService;
-    private readonly Action<CloneProgress> _reportProgress;
-
-    // Injected layout calculator so CloneOperation target sizes are set before validation checks
-    private readonly Action<CloneOperation> _calculateTargetLayout;
-
     public CloneValidator(
         ILogger logger,
         DiskEnumerator diskEnumerator,
-        VssSnapshotService vssService,
-        Action<CloneProgress> reportProgress,
-        Action<CloneOperation> calculateTargetLayout)
+        VssSnapshotService vssService)
     {
         _logger = logger;
         _diskEnumerator = diskEnumerator;
         _vssService = vssService;
-        _reportProgress = reportProgress;
-        _calculateTargetLayout = calculateTargetLayout;
     }
 
     /// <inheritdoc />
-    public async Task ValidateAsync(CloneOperation operation, CloneProgress progress)
+    public async Task ValidateAsync(CloneOperation operation, CloneProgress progress, Action<CloneProgress> reportProgress)
     {
         _logger.Info("Validating cloning operation...");
 
@@ -59,7 +50,7 @@ public class CloneValidator : ICloneValidator
             throw new InvalidOperationException("No partitions selected for cloning");
 
         // Calculate target layout (partition sizes for destination)
-        _calculateTargetLayout(operation);
+        CalculateTargetLayout(operation);
 
         var hasEfi = operation.PartitionsToClone.Any(p => p.IsEfiPartition);
         var hasSystem = operation.PartitionsToClone.Any(p => p.IsSystemPartition);
@@ -91,7 +82,7 @@ public class CloneValidator : ICloneValidator
             {
                 _logger.Warning($"Partition {driveLetter}: is BitLocker encrypted");
                 progress.StatusMessage = $"Warning: Drive {driveLetter}: has BitLocker enabled";
-                _reportProgress(progress);
+                reportProgress(progress);
             }
         }
 
@@ -105,6 +96,81 @@ public class CloneValidator : ICloneValidator
             throw new InvalidOperationException($"Cannot access target disk {operation.TargetDisk.DiskNumber}");
 
         _logger.Info("Validation passed");
+    }
+
+    /// <inheritdoc />
+    public void CalculateTargetLayout(CloneOperation operation)
+    {
+        const long OneMiB = 1024L * 1024L;
+        long totalSpaceRequired = OneMiB;
+        foreach (var p in operation.PartitionsToClone)
+        {
+            totalSpaceRequired += p.SizeBytes;
+            totalSpaceRequired += OneMiB;
+        }
+
+        var targetIsSmallerThanRequired = operation.TargetDisk.SizeBytes < totalSpaceRequired;
+        if (targetIsSmallerThanRequired && !operation.AllowSmallerTarget)
+        {
+            throw new InvalidOperationException($"Target disk is too small. Required: {DiskCloner.Core.Utilities.ByteFormatter.Format(totalSpaceRequired)}. Enable 'Allow smaller target' to auto-shrink.");
+        }
+
+        foreach (var partition in operation.PartitionsToClone)
+        {
+            partition.TargetSizeBytes = partition.SizeBytes;
+        }
+
+        var systemPartition = operation.PartitionsToClone.OrderBy(p => p.StartingOffset).FirstOrDefault(p => p.IsSystemPartition);
+        if (systemPartition == null) return;
+
+        if (targetIsSmallerThanRequired)
+        {
+            foreach (var partition in operation.PartitionsToClone)
+            {
+                if (!partition.IsSystemPartition)
+                    partition.TargetSizeBytes = Math.Max(OneMiB, (partition.SizeBytes / OneMiB) * OneMiB);
+            }
+
+            var maxSystemBytes = CalculateMaximumSystemPartitionBytes(operation, systemPartition);
+            if (maxSystemBytes < (5L * 1024 * 1024 * 1024))
+                throw new InvalidOperationException($"Target disk is too small even with shrinking. Only {DiskCloner.Core.Utilities.ByteFormatter.Format(maxSystemBytes)} available for Windows.");
+
+            systemPartition.TargetSizeBytes = maxSystemBytes;
+            _logger.Info($"Layout planning: shrinking Windows partition to {DiskCloner.Core.Utilities.ByteFormatter.Format(maxSystemBytes)} to fit target.");
+            return;
+        }
+
+        if (operation.AutoExpandWindowsPartition)
+        {
+            var maxSystemBytes = CalculateMaximumSystemPartitionBytes(operation, systemPartition);
+            if (maxSystemBytes > systemPartition.SizeBytes)
+            {
+                systemPartition.TargetSizeBytes = maxSystemBytes;
+                _logger.Info($"Layout planning: pre-expanding Windows partition to {DiskCloner.Core.Utilities.ByteFormatter.Format(maxSystemBytes)} while reserving space for remaining partitions.");
+            }
+        }
+    }
+
+    private long CalculateMaximumSystemPartitionBytes(CloneOperation operation, PartitionInfo systemPartition)
+    {
+        const long OneMiB = 1024L * 1024L;
+        var totalDiskMb = operation.TargetDisk.SizeBytes / OneMiB;
+        if (totalDiskMb <= 0) return 0;
+
+        long nonSystemMb = 0;
+        foreach (var partition in operation.PartitionsToClone.Where(p => !ReferenceEquals(p, systemPartition)))
+        {
+            nonSystemMb += Math.Max(1, (partition.TargetSizeBytes + OneMiB - 1) / OneMiB);
+        }
+
+        var baseOverheadMb = operation.SourceDisk.IsGpt ? 8L : 1L;
+        var implicitMsrMb = operation.SourceDisk.IsGpt && !operation.PartitionsToClone.Any(p => p.IsMsrPartition) ? 16L : 0L;
+        var alignmentSlackMb = operation.PartitionsToClone.Count + 2L;
+
+        var systemMb = totalDiskMb - nonSystemMb - baseOverheadMb - implicitMsrMb - alignmentSlackMb;
+        if (systemMb <= 0) return 0;
+
+        return systemMb * OneMiB;
     }
 
     /// <inheritdoc />
