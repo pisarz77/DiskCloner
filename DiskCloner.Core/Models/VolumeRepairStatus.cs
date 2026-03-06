@@ -3,7 +3,7 @@ namespace DiskCloner.Core.Models;
 /// <summary>
 /// Holds the outcome of a volume repair (chkdsk) operation.
 /// </summary>
-internal sealed class VolumeRepairStatus
+public sealed class VolumeRepairStatus
 {
     public bool ScanDetectedIssues { get; set; }
     public bool DirtyBeforeFix { get; set; }
