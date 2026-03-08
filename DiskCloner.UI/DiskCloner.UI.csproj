@@ -9,14 +9,13 @@
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
     <Compile Remove=".tmp\**\*.cs" />
     <ProjectReference Include="..\DiskCloner.Core\DiskCloner.Core.csproj" />
   </ItemGroup>
-
-  <ItemGroup>
     <Resource Include="Resources\**\*" />
   </ItemGroup>
 
