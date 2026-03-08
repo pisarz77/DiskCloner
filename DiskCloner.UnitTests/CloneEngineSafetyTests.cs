@@ -78,7 +78,7 @@ public class CloneEngineSafetyTests
     [Fact]
     public void GetCopyStrategy_UsesFileSystemMigrationForShrunkNtfsSystem()
     {
-        var copier = new PartitionCopier(new NoopLogger(), new VssSnapshotService(new NoopLogger()), null, default);
+        var copier = new PartitionCopier(new NoopLogger(), new VssSnapshotService(new NoopLogger()), _ => { }, default);
         var operation = CreateOperationForMapping();
         operation.AllowSmallerTarget = true;
 
@@ -103,10 +103,10 @@ public class CloneEngineSafetyTests
         
         var orchestrator = new CloneOrchestrator(
             logger, validator, new DiskpartService(logger, cts.Token), 
-            new PartitionCopier(logger, vssService, null, cts.Token),
-            new FileSystemMigrator(logger, vssService, validator, null, cts.Token),
-            new SystemQuietModeService(logger, null),
-            new IntegrityVerifier(logger, PartitionCopier.GetRawCopyLengthBytes, PartitionCopier.CalculateSafeEta, null, cts.Token),
+            new PartitionCopier(logger, vssService, _ => { }, cts.Token),
+            new FileSystemMigrator(logger, vssService, validator, _ => { }, cts.Token),
+            new SystemQuietModeService(logger, _ => { }),
+            new IntegrityVerifier(logger, PartitionCopier.GetRawCopyLengthBytes, PartitionCopier.CalculateSafeEta, _ => { }, cts.Token),
             new TargetDiskLifecycleManager(logger, validator),
             diskEnumerator, vssService, cts);
         var operation = new CloneOperation
