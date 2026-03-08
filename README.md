@@ -8,7 +8,7 @@ A Windows 10/11 system disk cloning application that clones the currently runnin
 
 ## Screenshots
 
-> **Note**: Add screenshots of the tool in action here! (e.g., `![Main View](assets/screenshot1.png)`)
+![Main Interface](assets/main_interface.png)
 
 ## Download
 
