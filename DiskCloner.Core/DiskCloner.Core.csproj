@@ -7,6 +7,12 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <Platforms>AnyCPU;x64</Platforms>
+    <Version>1.0.0</Version>
+    <Company>DiskCloner</Company>
+    <Authors>DiskCloner Authors</Authors>
+    <Product>Disk Cloner Core</Product>
+    <Description>Core cloning library for the Disk Cloner application.</Description>
+    <Copyright>Copyright (c) 2026</Copyright>
   </PropertyGroup>
 
   <ItemGroup>

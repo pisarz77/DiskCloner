@@ -1,6 +1,18 @@
 # Disk Cloner
 
+[![Build and Release](https://github.com/pisarz77/test-diskcloning/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/pisarz77/test-diskcloning/actions/workflows/build-and-release.yml)
+[![GitHub Release (latest by date)](https://img.shields.io/github/v/release/pisarz77/test-diskcloning)](https://github.com/pisarz77/test-diskcloning/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A Windows 10/11 system disk cloning application that clones the currently running system disk (including EFI/MSR/Recovery partitions and the main Windows partition C:) to a new target drive connected via USB.
+
+## Screenshots
+
+> **Note**: Add screenshots of the tool in action here! (e.g., `![Main View](assets/screenshot1.png)`)
+
+## Download
+
+[📥 Download the Latest Release](https://github.com/pisarz77/test-diskcloning/releases/latest)
 
 ## Features
 
